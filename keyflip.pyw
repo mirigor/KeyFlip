@@ -105,6 +105,11 @@ RU_TO_EN['ё'] = '`'
 RU_TO_EN['Ё'] = '~'
 
 def transform_text_by_keyboard_layout_based_on_hkl(s: str, hkl: int) -> str:
+    """
+    hkl: низшие 16 бит — LANGID (0x0419 = Russian)
+    Если текущая раскладка — Russian (0x0419) -> переводим RU -> EN.
+    Иначе -> EN -> RU.
+    """
     lang = hkl & 0xFFFF
     if lang == 0x0419:
         mapping = RU_TO_EN
@@ -187,8 +192,57 @@ def send_delete():
     time.sleep(0.01)
     _key_up(VK_DELETE)
 
+# ------------ Send Unicode via SendInput (не трогает clipboard) ------------
+INPUT_KEYBOARD = 1
+KEYEVENTF_UNICODE = 0x0004
+KEYEVENTF_KEYUP = 0x0002
+wintypes.ULONG_PTR = wintypes.WPARAM
+
+class KEYBDINPUT(ctypes.Structure):
+    _fields_ = [
+        ("wVk", wintypes.WORD),
+        ("wScan", wintypes.WORD),
+        ("dwFlags", wintypes.DWORD),
+        ("time", wintypes.DWORD),
+        ("dwExtraInfo", wintypes.ULONG_PTR)
+    ]
+
+class _INPUT_union(ctypes.Union):
+    _fields_ = [("ki", KEYBDINPUT), ("padding", wintypes.ULONG * 8)]
+
+class INPUT(ctypes.Structure):
+    _anonymous_ = ("union",)
+    _fields_ = [("type", wintypes.DWORD), ("union", _INPUT_union)]
+
+SendInput = user32.SendInput
+SendInput.argtypes = (wintypes.UINT, ctypes.POINTER(INPUT), ctypes.c_int)
+SendInput.restype = wintypes.UINT
+
+def send_unicode_via_sendinput(text: str, delay_between_keys: float = 0.001):
+    """Посылает символы через SendInput (UNICODE). Не трогает clipboard."""
+    if not text:
+        return
+    inputs = []
+    for ch in text:
+        code = ord(ch)
+        ki_down = KEYBDINPUT(0, code, KEYEVENTF_UNICODE, 0, 0)
+        inp_down = INPUT(INPUT_KEYBOARD, _INPUT_union(ki=ki_down))
+        inputs.append(inp_down)
+        ki_up = KEYBDINPUT(0, code, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP, 0, 0)
+        inp_up = INPUT(INPUT_KEYBOARD, _INPUT_union(ki=ki_up))
+        inputs.append(inp_up)
+    arr_type = INPUT * len(inputs)
+    arr = arr_type(*inputs)
+    sent = SendInput(len(arr), ctypes.byref(arr), ctypes.sizeof(INPUT))
+    if sent != len(arr):
+        logger.warning("send_unicode_via_sendinput: SendInput sent %d of %d events", sent, len(arr))
+    # небольшой пауз в конце, чтобы приложение успело обработать ввод
+    if delay_between_keys > 0:
+        time.sleep(delay_between_keys)
+
 # ------------ Clipboard helper (бережно) ------------
 def safe_restore_clipboard(old_clip: Optional[str]) -> None:
+    """Оставлена для совместимости; но по умолчанию мы НЕ восстанавливаем старый буфер."""
     try:
         if old_clip is None:
             pyperclip.copy('')
@@ -200,9 +254,15 @@ def safe_restore_clipboard(old_clip: Optional[str]) -> None:
         logger.exception("safe_restore_clipboard: не удалось восстановить буфер: %s", e)
 
 def safe_copy_from_selection(timeout_per_attempt: float = 0.6, max_attempts: int = 2) -> str:
+    """
+    Бережное копирование выделения:
+    - Опираемся на GetClipboardSequenceNumber (предпочтительно).
+    - НО: не восстанавливаем старый буфер. Возвращаем скопированный (текст).
+    """
     title, pid, proc_name = get_active_window_info()
     logger.debug("safe_copy: start. active window: %r pid=%s proc=%r", title, pid, proc_name)
 
+    # Сохраняем старый буфер ТОЛЬКО для случаев логирования/диагностики; не будем его восстанавливать.
     try:
         old_clip = pyperclip.paste()
     except Exception as e:
@@ -237,7 +297,7 @@ def safe_copy_from_selection(timeout_per_attempt: float = 0.6, max_attempts: int
                 return ""
             try:
                 send_ctrl_c()
-                logger.debug("safe_copy: sent Ctrl+C (attempt %d)", attempt)
+                logger.debug("safe_copy: sent ctrl+c (attempt %d)", attempt)
             except Exception as e:
                 logger.exception("safe_copy: ctrl+c exception: %s", e)
                 last_exception = e
@@ -246,7 +306,7 @@ def safe_copy_from_selection(timeout_per_attempt: float = 0.6, max_attempts: int
             changed = False
             while time.time() - t0 < timeout_per_attempt:
                 if foreground_changed():
-                    logger.debug("safe_copy: foreground changed during wait -> abort")
+                    logger.debug("safe_copy: foreground changed during wait after Ctrl+C -> abort")
                     return ""
                 try:
                     seq = user32.GetClipboardSequenceNumber()
@@ -261,18 +321,21 @@ def safe_copy_from_selection(timeout_per_attempt: float = 0.6, max_attempts: int
                 try:
                     cur = pyperclip.paste()
                     if cur == "":
-                        logger.debug("safe_copy: clipboard changed but empty -> no selection")
+                        logger.debug("safe_copy: clipboard changed but empty -> treat as no selection")
                         return ""
-                    logger.debug("safe_copy: buffer changed after Ctrl+C (len=%d)", len(cur))
+                    logger.debug("safe_copy: buffer changed after ctrl+c (len=%d)", len(cur))
+                    # ВАЖНО: возвращаем то, что скопировалось — не восстанавливаем старый буфер
                     return cur
                 except Exception as e:
                     logger.exception("safe_copy: paste() after ctrl+c failed: %s", e)
                     last_exception = e
 
-            # fallback Ctrl+Insert
+            # проверяем фокус снова перед Ctrl+Insert
             if foreground_changed():
                 logger.debug("safe_copy: foreground changed before Ctrl+Insert -> abort")
                 return ""
+
+            # fallback Ctrl+Insert (одна попытка)
             try:
                 VK_CONTROL = 0x11
                 VK_INSERT = 0x2D
@@ -281,7 +344,7 @@ def safe_copy_from_selection(timeout_per_attempt: float = 0.6, max_attempts: int
                 time.sleep(0.01)
                 _key_up(VK_INSERT)
                 _key_up(VK_CONTROL)
-                logger.debug("safe_copy: sent Ctrl+Insert (attempt %d)", attempt)
+                logger.debug("safe_copy: sent ctrl+insert (attempt %d)", attempt)
             except Exception as e:
                 logger.exception("safe_copy: ctrl+insert exception: %s", e)
                 last_exception = e
@@ -290,7 +353,7 @@ def safe_copy_from_selection(timeout_per_attempt: float = 0.6, max_attempts: int
             changed = False
             while time.time() - t0 < timeout_per_attempt:
                 if foreground_changed():
-                    logger.debug("safe_copy: foreground changed during wait after Insert -> abort")
+                    logger.debug("safe_copy: foreground changed during wait after Ctrl+Insert -> abort")
                     return ""
                 try:
                     seq = user32.GetClipboardSequenceNumber()
@@ -307,10 +370,10 @@ def safe_copy_from_selection(timeout_per_attempt: float = 0.6, max_attempts: int
                     if cur == "":
                         logger.debug("safe_copy: clipboard changed after insert but empty -> no selection")
                         return ""
-                    logger.debug("safe_copy: buffer changed after Ctrl+Insert (len=%d)", len(cur))
+                    logger.debug("safe_copy: buffer changed after ctrl+insert (len=%d)", len(cur))
                     return cur
                 except Exception as e:
-                    logger.exception("safe_copy: paste() after insert failed: %s", e)
+                    logger.exception("safe_copy: paste() after ctrl+insert failed: %s", e)
                     last_exception = e
 
             logger.debug("safe_copy: no clipboard change after attempt %d", attempt)
@@ -319,7 +382,7 @@ def safe_copy_from_selection(timeout_per_attempt: float = 0.6, max_attempts: int
         logger.debug("safe_copy: sequence not changed -> no selection")
         return ""
 
-    # ---- fallback: sentinel approach but careful ----
+    # ---- fallback: sentinel approach ----
     if foreground_changed():
         logger.debug("safe_copy: foreground changed before fallback -> abort")
         return ""
@@ -334,11 +397,10 @@ def safe_copy_from_selection(timeout_per_attempt: float = 0.6, max_attempts: int
 
     try:
         if foreground_changed():
-            logger.debug("safe_copy: foreground changed before fallback Ctrl+C -> restore and abort")
-            safe_restore_clipboard(old_clip)
+            logger.debug("safe_copy: foreground changed before fallback Ctrl+C -> abort")
             return ""
         send_ctrl_c()
-        logger.debug("safe_copy: sent Ctrl+C (fallback)")
+        logger.debug("safe_copy: sent ctrl+c (fallback)")
     except Exception as e:
         logger.exception("safe_copy: ctrl+c exception (fallback): %s", e)
         last_exception = e
@@ -346,11 +408,7 @@ def safe_copy_from_selection(timeout_per_attempt: float = 0.6, max_attempts: int
     t0 = time.time()
     while time.time() - t0 < timeout_per_attempt:
         if foreground_changed():
-            logger.debug("safe_copy: foreground changed during fallback wait -> restore and abort")
-            try:
-                safe_restore_clipboard(old_clip)
-            except Exception:
-                logger.exception("safe_copy: failed restore old_clip on abort")
+            logger.debug("safe_copy: foreground changed during fallback wait -> abort")
             return ""
         try:
             cur = pyperclip.paste()
@@ -362,26 +420,14 @@ def safe_copy_from_selection(timeout_per_attempt: float = 0.6, max_attempts: int
             continue
         if cur != sentinel:
             if cur == "":
-                try:
-                    safe_restore_clipboard(old_clip)
-                except Exception:
-                    logger.exception("safe_copy: failed restore old_clip after empty fallback")
                 return ""
-            try:
-                safe_restore_clipboard(old_clip)
-            except Exception:
-                logger.exception("safe_copy: failed restore old_clip after success fallback")
             logger.debug("safe_copy: buffer changed (fallback) len=%d", len(cur))
             return cur
         time.sleep(0.02)
 
     # last attempt: Ctrl+Insert
     if foreground_changed():
-        logger.debug("safe_copy: foreground changed before fallback Insert -> restore and abort")
-        try:
-            safe_restore_clipboard(old_clip)
-        except Exception:
-            logger.exception("safe_copy: failed restore old_clip on abort2")
+        logger.debug("safe_copy: foreground changed before fallback Ctrl+Insert -> abort")
         return ""
 
     try:
@@ -392,7 +438,7 @@ def safe_copy_from_selection(timeout_per_attempt: float = 0.6, max_attempts: int
         time.sleep(0.01)
         _key_up(VK_INSERT)
         _key_up(VK_CONTROL)
-        logger.debug("safe_copy: sent Ctrl+Insert (fallback last)")
+        logger.debug("safe_copy: sent ctrl+insert (fallback last)")
     except Exception as e:
         logger.exception("safe_copy: ctrl+insert exception (fallback last): %s", e)
         last_exception = e
@@ -400,11 +446,7 @@ def safe_copy_from_selection(timeout_per_attempt: float = 0.6, max_attempts: int
     t0 = time.time()
     while time.time() - t0 < timeout_per_attempt:
         if foreground_changed():
-            logger.debug("safe_copy: foreground changed during fallback insert wait -> restore and abort")
-            try:
-                safe_restore_clipboard(old_clip)
-            except Exception:
-                logger.exception("safe_copy: failed restore old_clip on abort3")
+            logger.debug("safe_copy: foreground changed during fallback insert wait -> abort")
             return ""
         try:
             cur = pyperclip.paste()
@@ -416,24 +458,12 @@ def safe_copy_from_selection(timeout_per_attempt: float = 0.6, max_attempts: int
             continue
         if cur != sentinel:
             if cur == "":
-                try:
-                    safe_restore_clipboard(old_clip)
-                except Exception:
-                    logger.exception("safe_copy: failed restore old_clip after empty fallback2")
                 return ""
-            try:
-                safe_restore_clipboard(old_clip)
-            except Exception:
-                logger.exception("safe_copy: failed restore old_clip after success fallback2")
             logger.debug("safe_copy: buffer changed after ctrl+insert (fallback) len=%d", len(cur))
             return cur
         time.sleep(0.02)
 
-    # nothing worked
-    try:
-        safe_restore_clipboard(old_clip)
-    except Exception:
-        logger.exception("safe_copy: failed final restore old_clip")
+    # ничего не получилось
     logger.warning("safe_copy: НЕ удалось получить выделение. last_exc=%r", repr(last_exception))
     return ""
 
@@ -442,24 +472,17 @@ _enabled_lock = threading.Lock()
 _enabled: bool = True  # default; will be overwritten by load_config()
 
 def load_config():
-    """
-    При старте всегда включаем функционал (enabled=True) и сохраняем это в файл.
-    Это гарантирует, что даже если в конфиге было false — после запуска он станет true.
-    """
     global _enabled
     try:
-        # Принудительно включаем при старте
+        # При старте всегда включаем функционал (enabled=True) и сохраняем это в файл.
         with _enabled_lock:
             _enabled = True
-
-        # Сохраняем текущее состояние (перезапишем конфиг)
         save_config()
         logger.debug("config: startup forced enabled=True (config saved)")
     except Exception:
         logger.exception("config: forced enable on startup failed; using default enabled=True")
         with _enabled_lock:
             _enabled = True
-
 
 def save_config():
     try:
@@ -520,6 +543,7 @@ _F4_DEBOUNCE_SEC = 0.6
 
 def _f4_invoker():
     global _last_f4_ts
+    # if disabled -> ignore immediately
     if not is_enabled():
         logger.debug("F4: ignored because enabled==False")
         return
@@ -555,12 +579,15 @@ def handle_hotkey_transform():
         title, pid, proc_name = get_active_window_info()
         logger.info("handle: active window: %r pid=%s proc=%r", title, pid, proc_name)
 
-        # save current clipboard to restore later
+        # save current clipboard text only for debug/diagnostics (we НЕ будем восстанавливать его)
         try:
-            saved = pyperclip.paste()
-            logger.debug("handle: сохранён буфер (len=%s)", None if saved is None else len(saved))
-        except Exception as e:
-            logger.exception("handle: не удалось сохранить буфер: %s", e)
+            saved = None
+            try:
+                saved = pyperclip.paste()
+            except Exception:
+                saved = None
+            logger.debug("handle: прочитал (но не буду восстанавливать) буфер text-len=%s", None if saved is None else len(saved))
+        except Exception:
             saved = None
 
         # get foreground thread HKL so we know direction
@@ -574,16 +601,15 @@ def handle_hotkey_transform():
             hkl = 0
             logger.exception("handle: не удалось получить HKL, предполагаем EN")
 
-        # read selection carefully
+        # read selection carefully (this WILL change clipboard to the selection)
         selected = safe_copy_from_selection(timeout_per_attempt=0.6, max_attempts=2)
         if selected is None:
             selected = ""
         logger.info("handle: прочитано выделение (len=%d)", len(selected))
 
-        # if nothing selected -> do nothing (don't loop sentinel into clipboard!)
+        # if nothing selected -> do nothing
         if not selected:
-            logger.info("handle: выделение пустое — ничего не делаю. Восстанавливаю буфер.")
-            safe_restore_clipboard(saved)
+            logger.info("handle: выделение пустое — ничего не делаю.")
             return
 
         # choose mapping based on hkl
@@ -593,7 +619,6 @@ def handle_hotkey_transform():
 
         if converted == selected:
             logger.info("handle: преобразованный текст совпадает с исходным — ничего не меняю.")
-            safe_restore_clipboard(saved)
             return
 
         # delete selection
@@ -603,14 +628,20 @@ def handle_hotkey_transform():
         except Exception as e:
             logger.exception("handle: delete exception: %s", e)
 
-        # paste via clipboard + Ctrl+V (reliable across apps)
+        # вставляем через SendInput (не трогаем clipboard)
         try:
-            pyperclip.copy(converted)
-            time.sleep(0.02)
-            send_ctrl_v()
-            logger.debug("handle: вставил через буфер (ctrl+v)")
+            send_unicode_via_sendinput(converted, delay_between_keys=0.001)
+            logger.debug("handle: вставил через SendInput (unicode) — без использования clipboard")
         except Exception as e:
-            logger.exception("handle: paste exception: %s", e)
+            logger.exception("handle: send_unicode_via_sendinput failed: %s", e)
+            # fallback на clipboard paste (опасно для non-text formats, но это fallback)
+            try:
+                pyperclip.copy(converted)
+                time.sleep(0.02)
+                send_ctrl_v()
+                logger.debug("handle: fallback: вставил через буфер (ctrl+v)")
+            except Exception as e2:
+                logger.exception("handle: fallback paste failed: %s", e2)
 
         # переключаем раскладку в окне (меняем на противоположную)
         try:
@@ -634,18 +665,17 @@ def handle_hotkey_transform():
         except Exception:
             logger.exception("handle: switch layout failed (foreground-thread)")
 
-        # restore saved clipboard
-        safe_restore_clipboard(saved)
-        logger.info("handle: завершено успешно, буфер восстановлен")
+        # ВАЖНО: не восстанавливаем старый буфер — оставляем то, что сейчас в clipboard (обычно выделение)
+        logger.info("handle: завершено успешно. (буфер оставлен как есть — в нём будет выделение)")
     except Exception as e:
         logger.exception("handle_hotkey_transform: исключение при обработке: %s", e)
-        try:
-            safe_restore_clipboard(None)
-        except Exception:
-            pass
 
 # ------------ Tray / Icon (с пунктом Вкл/Выкл и иконками) ----------------
 def prepare_tray_icon_image(enabled: Optional[bool] = None) -> Image.Image:
+    """
+    Возвращает PIL.Image для трея. Если файлы icon_on/icon_off присутствуют, используем их,
+    иначе генерируем простую квадратную иконку с K и цветом (зелёный/красный).
+    """
     if enabled is None:
         enabled = is_enabled()
 
@@ -658,25 +688,28 @@ def prepare_tray_icon_image(enabled: Optional[bool] = None) -> Image.Image:
         except Exception:
             logger.exception("Tray icon: cannot open %s", path)
 
+    # fallback: draw simple image
     size = (64, 64)
-    bg = (76, 175, 80, 255) if enabled else (220, 53, 69, 255)
+    bg = (76, 175, 80, 255) if enabled else (220, 53, 69, 255)  # green / red
     img = Image.new('RGBA', size, bg)
     d = ImageDraw.Draw(img)
     try:
-        d.rectangle((8, 16, 56, 48), outline=(255, 255, 255), width=2)
-        d.text((16, 12), "KF", fill=(255, 255, 255))
+        d.rectangle((8, 16, 56, 48), outline=(255,255,255), width=2)
+        d.text((16, 12), "KF", fill=(255,255,255))
     except Exception:
         pass
     return img
 
 def enabled_menu_text(item):
+    # item аргумент необходим pystray (menu passes it). Возвращаем текст с эмодзи.
     return "❌ Выключить" if is_enabled() else "✅ Включить"
 
 def toggle_enabled(icon, item):
+    """Action called from tray menu: flips state, updates config and icon image immediately."""
     new_state = not is_enabled()
     set_enabled(new_state)
     logger.info("Tray: toggled enabled -> %s", new_state)
-    # immediately update hotkey registration
+    # Обновляем регистрацию хоткея F4
     try:
         if new_state:
             register_f4()
@@ -684,8 +717,7 @@ def toggle_enabled(icon, item):
             unregister_f4()
     except Exception:
         logger.exception("toggle_enabled: failed to update hotkey registration")
-
-    # Обновляем иконку прямо сейчас (pystray Icon передаётся первым аргументом)
+    # Обновляем иконку прямо сейчас
     try:
         if icon is not None:
             icon.icon = prepare_tray_icon_image(new_state)
@@ -709,11 +741,13 @@ def on_exit(icon=None, item=None):
 
 def tray_worker():
     img = prepare_tray_icon_image()
+    # menu: state toggle + exit
     menu = pystray.Menu(
         pystray.MenuItem(enabled_menu_text, toggle_enabled),
         pystray.MenuItem("Выход", on_exit)
     )
     icon = pystray.Icon(APP_NAME, img, APP_NAME, menu=menu)
+    # ensure icon image matches saved state (in case load_config changed it earlier)
     try:
         icon.icon = prepare_tray_icon_image(is_enabled())
     except Exception:
