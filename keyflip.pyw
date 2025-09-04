@@ -442,24 +442,24 @@ _enabled_lock = threading.Lock()
 _enabled: bool = True  # default; will be overwritten by load_config()
 
 def load_config():
+    """
+    При старте всегда включаем функционал (enabled=True) и сохраняем это в файл.
+    Это гарантирует, что даже если в конфиге было false — после запуска он станет true.
+    """
     global _enabled
     try:
-        if os.path.isfile(CONFIG_FILE):
-            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-                j = json.load(f)
-            val = j.get("enabled", True)
-            with _enabled_lock:
-                _enabled = bool(val)
-            logger.debug("config: loaded enabled=%s from %s", _enabled, CONFIG_FILE)
-        else:
-            with _enabled_lock:
-                _enabled = True
-            save_config()
-            logger.debug("config: default enabled=True (config created)")
-    except Exception:
-        logger.exception("config: load failed; using default enabled=True")
+        # Принудительно включаем при старте
         with _enabled_lock:
             _enabled = True
+
+        # Сохраняем текущее состояние (перезапишем конфиг)
+        save_config()
+        logger.debug("config: startup forced enabled=True (config saved)")
+    except Exception:
+        logger.exception("config: forced enable on startup failed; using default enabled=True")
+        with _enabled_lock:
+            _enabled = True
+
 
 def save_config():
     try:
