@@ -28,6 +28,7 @@ except Exception:
 
 # ctypes helpers
 user32 = ctypes.windll.user32
+kernel32 = ctypes.windll.kernel32
 from ctypes import wintypes
 
 # --- Константы / пути ---
@@ -236,7 +237,6 @@ def send_unicode_via_sendinput(text: str, delay_between_keys: float = 0.001):
     sent = SendInput(len(arr), ctypes.byref(arr), ctypes.sizeof(INPUT))
     if sent != len(arr):
         logger.warning("send_unicode_via_sendinput: SendInput sent %d of %d events", sent, len(arr))
-    # небольшой пауз в конце, чтобы приложение успело обработать ввод
     if delay_between_keys > 0:
         time.sleep(delay_between_keys)
 
@@ -262,7 +262,6 @@ def safe_copy_from_selection(timeout_per_attempt: float = 0.6, max_attempts: int
     title, pid, proc_name = get_active_window_info()
     logger.debug("safe_copy: start. active window: %r pid=%s proc=%r", title, pid, proc_name)
 
-    # Сохраняем старый буфер ТОЛЬКО для случаев логирования/диагностики; не будем его восстанавливать.
     try:
         old_clip = pyperclip.paste()
     except Exception as e:
@@ -324,18 +323,15 @@ def safe_copy_from_selection(timeout_per_attempt: float = 0.6, max_attempts: int
                         logger.debug("safe_copy: clipboard changed but empty -> treat as no selection")
                         return ""
                     logger.debug("safe_copy: buffer changed after ctrl+c (len=%d)", len(cur))
-                    # ВАЖНО: возвращаем то, что скопировалось — не восстанавливаем старый буфер
                     return cur
                 except Exception as e:
                     logger.exception("safe_copy: paste() after ctrl+c failed: %s", e)
                     last_exception = e
 
-            # проверяем фокус снова перед Ctrl+Insert
+            # fallback Ctrl+Insert
             if foreground_changed():
                 logger.debug("safe_copy: foreground changed before Ctrl+Insert -> abort")
                 return ""
-
-            # fallback Ctrl+Insert (одна попытка)
             try:
                 VK_CONTROL = 0x11
                 VK_INSERT = 0x2D
@@ -463,7 +459,7 @@ def safe_copy_from_selection(timeout_per_attempt: float = 0.6, max_attempts: int
             return cur
         time.sleep(0.02)
 
-    # ничего не получилось
+    # nothing worked
     logger.warning("safe_copy: НЕ удалось получить выделение. last_exc=%r", repr(last_exception))
     return ""
 
@@ -508,28 +504,59 @@ def set_enabled(val: bool):
 # Load config on startup
 load_config()
 
-# ------------ Hotkey registration helpers ------------
+# ------------ Hotkey constants & thread messaging ------------
 HOTKEY_ID_F4 = 1
 HOTKEY_ID_F10 = 2
 MOD_NONE = 0
 VK_F4 = 0x73
 VK_F10 = 0x79
 
-def register_f4():
+# We'll use PostThreadMessage to request registration/unregistration in the hotkey thread
+WM_USER = 0x0400
+MSG_REGISTER_F4 = WM_USER + 1
+MSG_UNREGISTER_F4 = WM_USER + 2
+
+# id потока, где вызывается win_hotkey_loop (будет установлен в начале цикла)
+HOTKEY_THREAD_ID = 0  # заполнится в win_hotkey_loop
+
+def post_register_f4(should_register: bool):
+    """Посылает сообщение потоку hotkey чтобы тот зарегистрировал/удалил F4."""
+    global HOTKEY_THREAD_ID
+    if HOTKEY_THREAD_ID == 0:
+        logger.warning("post_register_f4: HOTKEY_THREAD_ID not ready yet -> cannot post")
+        return False
+    msg = MSG_REGISTER_F4 if should_register else MSG_UNREGISTER_F4
+    # wParam = 1 for register, 0 for unregister (необязательно но удобно)
+    wparam = 1 if should_register else 0
+    try:
+        res = user32.PostThreadMessageW(HOTKEY_THREAD_ID, msg, wparam, 0)
+        if res == 0:
+            err = kernel32.GetLastError()
+            logger.error("post_register_f4: PostThreadMessageW failed (err=%d)", err)
+            return False
+        logger.debug("post_register_f4: posted msg=%d wParam=%d to thread %d", msg, wparam, HOTKEY_THREAD_ID)
+        return True
+    except Exception:
+        logger.exception("post_register_f4: exception while posting")
+        return False
+
+# ------------ Hotkey register helpers (used only from hotkey thread) ------------
+def register_f4_in_thread():
     try:
         ok = user32.RegisterHotKey(None, HOTKEY_ID_F4, MOD_NONE, VK_F4)
         if ok:
-            logger.debug("register_f4: F4 registered")
+            logger.debug("register_f4: F4 registered in hotkey thread")
         else:
-            logger.error("register_f4: failed to register F4 (maybe already registered by another app)")
+            err = kernel32.GetLastError()
+            logger.error("register_f4: failed to register F4 (err=%d)", err)
     except Exception:
         logger.exception("register_f4: exception while registering F4")
 
-def unregister_f4():
+def unregister_f4_in_thread():
     try:
         ok = user32.UnregisterHotKey(None, HOTKEY_ID_F4)
         if ok:
-            logger.debug("unregister_f4: F4 unregistered")
+            logger.debug("unregister_f4: F4 unregistered in hotkey thread")
         else:
             logger.debug("unregister_f4: UnregisterHotKey returned False (probably not registered)")
     except Exception:
@@ -709,15 +736,15 @@ def toggle_enabled(icon, item):
     new_state = not is_enabled()
     set_enabled(new_state)
     logger.info("Tray: toggled enabled -> %s", new_state)
-    # Обновляем регистрацию хоткея F4
+    # Вместо прямого вызова Register/Unregister ми постим сообщение в hotkey-thread
     try:
-        if new_state:
-            register_f4()
-        else:
-            unregister_f4()
+        ok = post_register_f4(new_state)
+        if not ok:
+            logger.warning("toggle_enabled: post_register_f4 returned False")
     except Exception:
-        logger.exception("toggle_enabled: failed to update hotkey registration")
-    # Обновляем иконку прямо сейчас
+        logger.exception("toggle_enabled: failed to post register/unregister request")
+
+    # Обновляем иконку прямо сейчас (pystray Icon передаётся первым аргументом)
     try:
         if icon is not None:
             icon.icon = prepare_tray_icon_image(new_state)
@@ -761,17 +788,26 @@ def tray_worker():
 
 # ------------ WinAPI hotkey loop ------------
 def win_hotkey_loop():
-    # Register F10 always (for exit)
+    global HOTKEY_THREAD_ID
+    # устанавливаем id текущего потока — другим потокам можно будет посылать PostThreadMessageW
+    try:
+        HOTKEY_THREAD_ID = kernel32.GetCurrentThreadId()
+        logger.debug("win_hotkey_loop: HOTKEY_THREAD_ID = %d", HOTKEY_THREAD_ID)
+    except Exception:
+        HOTKEY_THREAD_ID = 0
+        logger.exception("win_hotkey_loop: failed to get thread id")
+
+    # Register F10 always (for exit) — делаем это в этом потоке
     if not user32.RegisterHotKey(None, HOTKEY_ID_F10, MOD_NONE, VK_F10):
         logger.error("Не удалось зарегистрировать F10 через RegisterHotKey")
     else:
         logger.debug("Зарегистрирован F10 via RegisterHotKey")
 
-    # Register F4 only if enabled
+    # Register F4 only if enabled (this registration happens in this thread's message queue)
     if is_enabled():
-        register_f4()
+        register_f4_in_thread()
     else:
-        # ensure it's not registered
+        # ensure it's not registered in this thread
         try:
             user32.UnregisterHotKey(None, HOTKEY_ID_F4)
         except Exception:
@@ -783,11 +819,34 @@ def win_hotkey_loop():
             has = user32.GetMessageW(ctypes.byref(msg), None, 0, 0)
             if has == 0:
                 break
+
+            # обработка наших внутренних сообщений (регистрация/отмена регистрации)
+            if msg.message == MSG_REGISTER_F4:
+                logger.debug("win_hotkey_loop: MSG_REGISTER_F4 received wParam=%s", int(msg.wParam))
+                try:
+                    register_f4_in_thread()
+                except Exception:
+                    logger.exception("win_hotkey_loop: register_f4_in_thread failed")
+                # не DispatchMessage для этого пользовательского сообщения
+                continue
+            elif msg.message == MSG_UNREGISTER_F4:
+                logger.debug("win_hotkey_loop: MSG_UNREGISTER_F4 received")
+                try:
+                    unregister_f4_in_thread()
+                except Exception:
+                    logger.exception("win_hotkey_loop: unregister_f4_in_thread failed")
+                continue
+
             if msg.message == 0x0312:  # WM_HOTKEY
                 hotkey_id = msg.wParam
                 if hotkey_id == HOTKEY_ID_F4:
-                    logger.debug("WM_HOTKEY: F4 received")
-                    _f4_invoker()
+                    # если пришёл F4 — сработает только если он зарегистрирован в этом потоке
+                    # дополнительная защита: если состояние выключено — игнорируем
+                    if not is_enabled():
+                        logger.debug("WM_HOTKEY: F4 received but currently disabled -> ignored")
+                    else:
+                        logger.debug("WM_HOTKEY: F4 received")
+                        _f4_invoker()
                 elif hotkey_id == HOTKEY_ID_F10:
                     logger.debug("WM_HOTKEY: F10 received -> exit")
                     on_exit()
