@@ -220,25 +220,35 @@ SendInput.argtypes = (wintypes.UINT, ctypes.POINTER(INPUT), ctypes.c_int)
 SendInput.restype = wintypes.UINT
 
 def send_unicode_via_sendinput(text: str, delay_between_keys: float = 0.001):
-    """Посылает символы через SendInput (UNICODE). Не трогает clipboard."""
+    """Посылает символы через SendInput (UNICODE). Без использования буфера обмена."""
     if not text:
         return
+
     inputs = []
     for ch in text:
         code = ord(ch)
+        # key down
         ki_down = KEYBDINPUT(0, code, KEYEVENTF_UNICODE, 0, 0)
         inp_down = INPUT(INPUT_KEYBOARD, _INPUT_union(ki=ki_down))
         inputs.append(inp_down)
+        # key up
         ki_up = KEYBDINPUT(0, code, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP, 0, 0)
         inp_up = INPUT(INPUT_KEYBOARD, _INPUT_union(ki=ki_up))
         inputs.append(inp_up)
-    arr_type = INPUT * len(inputs)
-    arr = arr_type(*inputs)
-    sent = SendInput(len(arr), ctypes.byref(arr), ctypes.sizeof(INPUT))
-    if sent != len(arr):
-        logger.warning("send_unicode_via_sendinput: SendInput sent %d of %d events", sent, len(arr))
+
+    n = len(inputs)
+    ArrType = INPUT * n
+    arr = ArrType(*inputs)
+
+    p = ctypes.pointer(arr[0])
+
+    sent = SendInput(n, p, ctypes.sizeof(INPUT))
+    if sent != n:
+        logger.warning("send_unicode_via_sendinput: SendInput sent %d of %d events", sent, n)
+
     if delay_between_keys > 0:
         time.sleep(delay_between_keys)
+
 
 # ------------ Clipboard helper (бережно) ------------
 def safe_restore_clipboard(old_clip: Optional[str]) -> None:
