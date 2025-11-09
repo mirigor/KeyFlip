@@ -18,7 +18,7 @@ try:
     import pystray
     import psutil
     import win32event, win32api, win32con
-except Exception:
+except Exception:  # noqa
     print(
         "❌ Требуются библиотеки: pyperclip, Pillow, pystray, psutil, pywin32\n"
         "Установи командой:\n"
@@ -46,7 +46,7 @@ ERROR_ALREADY_EXISTS = 183
 if win32api.GetLastError() == ERROR_ALREADY_EXISTS:
     try:
         win32api.MessageBox(0, f"Программа {APP_NAME} уже запущена!", APP_NAME, 0)
-    except Exception:
+    except Exception:  # noqa
         print(f"{APP_NAME} уже запущена!")
     sys.exit(0)
 
@@ -137,16 +137,17 @@ def transform_text_by_keyboard_layout_based_on_hkl(s: str, hkl: int) -> str:
 def get_active_window_info() -> Tuple[str, int, Optional[str]]:
     try:
         hwnd = user32.GetForegroundWindow()
-    except Exception:
+    except Exception:  # noqa
         return "<unknown>", 0, None
-    title = "<unknown>"
+
     try:
         length = user32.GetWindowTextLengthW(hwnd)
         buff = ctypes.create_unicode_buffer(length + 1)
         user32.GetWindowTextW(hwnd, buff, length + 1)
         title = buff.value
-    except Exception:
+    except Exception:  # noqa
         title = "<unknown>"
+
     pid = 0
     proc_name = None
     try:
@@ -157,9 +158,9 @@ def get_active_window_info() -> Tuple[str, int, Optional[str]]:
             try:
                 proc = psutil.Process(pid)
                 proc_name = proc.name()
-            except Exception:
+            except Exception:  # noqa
                 proc_name = None
-    except Exception:
+    except Exception:  # noqa
         pass
     return title, pid, proc_name
 
@@ -237,8 +238,8 @@ def send_unicode_via_sendinput(text: str, delay_between_keys: float = 0.001):
         inputs.append(inp_up)
 
     n = len(inputs)
-    ArrType = INPUT * n
-    arr = ArrType(*inputs)
+    arr_type = INPUT * n
+    arr = arr_type(*inputs)
 
     p = ctypes.pointer(arr[0])
 
@@ -273,12 +274,6 @@ def safe_copy_from_selection(timeout_per_attempt: float = 0.6, max_attempts: int
     logger.debug("safe_copy: start. active window: %r pid=%s proc=%r", title, pid, proc_name)
 
     try:
-        old_clip = pyperclip.paste()
-    except Exception as e:
-        logger.debug("safe_copy: can't read old clipboard: %s", e)
-        old_clip = None
-
-    try:
         initial_hwnd = user32.GetForegroundWindow()
     except Exception as e:
         logger.debug("safe_copy: GetForegroundWindow failed: %s", e)
@@ -288,7 +283,7 @@ def safe_copy_from_selection(timeout_per_attempt: float = 0.6, max_attempts: int
         try:
             cur = user32.GetForegroundWindow()
             return initial_hwnd is not None and cur is not None and cur != initial_hwnd
-        except Exception:
+        except Exception:  # noqa
             return False
 
     try:
@@ -309,7 +304,6 @@ def safe_copy_from_selection(timeout_per_attempt: float = 0.6, max_attempts: int
                 logger.debug("safe_copy: sent ctrl+c (attempt %d)", attempt)
             except Exception as e:
                 logger.exception("safe_copy: ctrl+c exception: %s", e)
-                last_exception = e
 
             t0 = time.time()
             changed = False
@@ -319,7 +313,7 @@ def safe_copy_from_selection(timeout_per_attempt: float = 0.6, max_attempts: int
                     return ""
                 try:
                     seq = user32.GetClipboardSequenceNumber()
-                except Exception:
+                except Exception:  # noqa
                     seq = None
                 if seq is not None and seq != old_seq:
                     changed = True
@@ -336,7 +330,6 @@ def safe_copy_from_selection(timeout_per_attempt: float = 0.6, max_attempts: int
                     return cur
                 except Exception as e:
                     logger.exception("safe_copy: paste() after ctrl+c failed: %s", e)
-                    last_exception = e
 
             # fallback Ctrl+Insert
             if foreground_changed():
@@ -353,7 +346,6 @@ def safe_copy_from_selection(timeout_per_attempt: float = 0.6, max_attempts: int
                 logger.debug("safe_copy: sent ctrl+insert (attempt %d)", attempt)
             except Exception as e:
                 logger.exception("safe_copy: ctrl+insert exception: %s", e)
-                last_exception = e
 
             t0 = time.time()
             changed = False
@@ -363,7 +355,7 @@ def safe_copy_from_selection(timeout_per_attempt: float = 0.6, max_attempts: int
                     return ""
                 try:
                     seq = user32.GetClipboardSequenceNumber()
-                except Exception:
+                except Exception:  # noqa
                     seq = None
                 if seq is not None and seq != old_seq:
                     changed = True
@@ -380,7 +372,6 @@ def safe_copy_from_selection(timeout_per_attempt: float = 0.6, max_attempts: int
                     return cur
                 except Exception as e:
                     logger.exception("safe_copy: paste() after ctrl+insert failed: %s", e)
-                    last_exception = e
 
             logger.debug("safe_copy: no clipboard change after attempt %d", attempt)
             break
@@ -485,7 +476,7 @@ def load_config():
             _enabled = True
         save_config()
         logger.debug("config: startup forced enabled=True (config saved)")
-    except Exception:
+    except Exception:  # noqa
         logger.exception("config: forced enable on startup failed; using default enabled=True")
         with _enabled_lock:
             _enabled = True
@@ -497,7 +488,7 @@ def save_config():
         with open(CONFIG_FILE, "w", encoding="utf-8") as f:
             json.dump(j, f)
         logger.debug("config: saved enabled=%s to %s", j["enabled"], CONFIG_FILE)
-    except Exception:
+    except Exception:  # noqa
         logger.exception("config: save failed")
 
 def is_enabled() -> bool:
@@ -546,7 +537,7 @@ def post_register_f4(should_register: bool):
             return False
         logger.debug("post_register_f4: posted msg=%d wParam=%d to thread %d", msg, wparam, HOTKEY_THREAD_ID)
         return True
-    except Exception:
+    except Exception:  # noqa
         logger.exception("post_register_f4: exception while posting")
         return False
 
@@ -559,7 +550,7 @@ def register_f4_in_thread():
         else:
             err = kernel32.GetLastError()
             logger.error("register_f4: failed to register F4 (err=%d)", err)
-    except Exception:
+    except Exception:  # noqa
         logger.exception("register_f4: exception while registering F4")
 
 def unregister_f4_in_thread():
@@ -569,7 +560,7 @@ def unregister_f4_in_thread():
             logger.debug("unregister_f4: F4 unregistered in hotkey thread")
         else:
             logger.debug("unregister_f4: UnregisterHotKey returned False (probably not registered)")
-    except Exception:
+    except Exception:  # noqa
         logger.exception("unregister_f4: exception while unregistering F4")
 
 # ------------ Handler & Hotkey logic ------------
@@ -601,7 +592,7 @@ def _f4_invoker():
         finally:
             try:
                 _handler_lock.release()
-            except Exception:
+            except Exception:  # noqa
                 pass
 
     threading.Thread(target=_worker, daemon=True).start()
@@ -621,10 +612,10 @@ def handle_hotkey_transform():
             saved = None
             try:
                 saved = pyperclip.paste()
-            except Exception:
+            except Exception:  # noqa
                 saved = None
             logger.debug("handle: прочитал (но не буду восстанавливать) буфер text-len=%s", None if saved is None else len(saved))
-        except Exception:
+        except Exception:  # noqa
             saved = None
 
         # get foreground thread HKL so we know direction
@@ -634,7 +625,7 @@ def handle_hotkey_transform():
             thread_id = user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid_c))
             hkl = user32.GetKeyboardLayout(thread_id) & 0xFFFF
             logger.debug("handle: foreground thread hkl=0x%04X", hkl)
-        except Exception:
+        except Exception:  # noqa
             hkl = 0
             logger.exception("handle: не удалось получить HKL, предполагаем EN")
 
@@ -695,11 +686,11 @@ def handle_hotkey_transform():
                     try:
                         user32.ActivateKeyboardLayout(hkl_new, 0)
                         logger.debug("handle: ActivateKeyboardLayout used as fallback")
-                    except Exception:
+                    except Exception:  # noqa
                         logger.exception("handle: fallback ActivateKeyboardLayout also failed")
                 else:
                     logger.debug("handle: posted WM_INPUTLANGCHANGEREQUEST -> success")
-        except Exception:
+        except Exception:  # noqa
             logger.exception("handle: switch layout failed (foreground-thread)")
 
         # ВАЖНО: не восстанавливаем старый буфер — оставляем то, что сейчас в clipboard (обычно выделение)
@@ -722,7 +713,7 @@ def prepare_tray_icon_image(enabled: Optional[bool] = None) -> Image.Image:
             img = Image.open(path)
             logger.debug("Tray icon: using %s", path)
             return img
-        except Exception:
+        except Exception:  # noqa
             logger.exception("Tray icon: cannot open %s", path)
 
     # fallback: draw simple image
@@ -733,7 +724,7 @@ def prepare_tray_icon_image(enabled: Optional[bool] = None) -> Image.Image:
     try:
         d.rectangle((8, 16, 56, 48), outline=(255,255,255), width=2)
         d.text((16, 12), "KF", fill=(255,255,255))
-    except Exception:
+    except Exception:  # noqa
         pass
     return img
 
@@ -751,14 +742,14 @@ def toggle_enabled(icon, item):
         ok = post_register_f4(new_state)
         if not ok:
             logger.warning("toggle_enabled: post_register_f4 returned False")
-    except Exception:
+    except Exception:  # noqa
         logger.exception("toggle_enabled: failed to post register/unregister request")
 
     # Обновляем иконку прямо сейчас (pystray Icon передаётся первым аргументом)
     try:
         if icon is not None:
             icon.icon = prepare_tray_icon_image(new_state)
-    except Exception:
+    except Exception:  # noqa
         logger.exception("Tray: failed to update icon image after toggle")
 
 def on_exit(icon=None, item=None):
@@ -767,11 +758,11 @@ def on_exit(icon=None, item=None):
     try:
         if icon:
             icon.stop()
-    except Exception:
+    except Exception:  # noqa
         logger.exception("on_exit: ошибка при остановке иконки")
     try:
         win32event.ReleaseMutex(mutex_handle)
-    except Exception:
+    except Exception:  # noqa
         pass
     logger.info("Завершение работы.")
     return
@@ -787,7 +778,7 @@ def tray_worker():
     # ensure icon image matches saved state (in case load_config changed it earlier)
     try:
         icon.icon = prepare_tray_icon_image(is_enabled())
-    except Exception:
+    except Exception:  # noqa
         logger.exception("tray_worker: failed to set initial icon")
 
     try:
@@ -803,7 +794,7 @@ def win_hotkey_loop():
     try:
         HOTKEY_THREAD_ID = kernel32.GetCurrentThreadId()
         logger.debug("win_hotkey_loop: HOTKEY_THREAD_ID = %d", HOTKEY_THREAD_ID)
-    except Exception:
+    except Exception:  # noqa
         HOTKEY_THREAD_ID = 0
         logger.exception("win_hotkey_loop: failed to get thread id")
 
@@ -820,7 +811,7 @@ def win_hotkey_loop():
         # ensure it's not registered in this thread
         try:
             user32.UnregisterHotKey(None, HOTKEY_ID_F4)
-        except Exception:
+        except Exception:  # noqa
             pass
 
     try:
@@ -835,7 +826,7 @@ def win_hotkey_loop():
                 logger.debug("win_hotkey_loop: MSG_REGISTER_F4 received wParam=%s", int(msg.wParam))
                 try:
                     register_f4_in_thread()
-                except Exception:
+                except Exception:  # noqa
                     logger.exception("win_hotkey_loop: register_f4_in_thread failed")
                 # не DispatchMessage для этого пользовательского сообщения
                 continue
@@ -843,7 +834,7 @@ def win_hotkey_loop():
                 logger.debug("win_hotkey_loop: MSG_UNREGISTER_F4 received")
                 try:
                     unregister_f4_in_thread()
-                except Exception:
+                except Exception:  # noqa
                     logger.exception("win_hotkey_loop: unregister_f4_in_thread failed")
                 continue
 
@@ -866,7 +857,7 @@ def win_hotkey_loop():
         try:
             user32.UnregisterHotKey(None, HOTKEY_ID_F4)
             user32.UnregisterHotKey(None, HOTKEY_ID_F10)
-        except Exception:
+        except Exception:  # noqa
             pass
 
 # ------------ Main ------------
@@ -888,7 +879,7 @@ def main():
     finally:
         try:
             win32event.ReleaseMutex(mutex_handle)
-        except Exception:
+        except Exception:  # noqa
             pass
         logger.info("main: завершение")
 
