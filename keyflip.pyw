@@ -56,7 +56,7 @@ def read_file_logging_flag() -> bool:
 
 def write_file_logging_flag(val: bool) -> bool:
     """
-    Записывает флаг file_logging в CONFIG_FILE, оставляя при этом поле enabled, если оно есть.
+    Записывает флаг file_logging в CONFIG_FILE, оставляя при этом поля enabled/autorun, если они есть.
     Возвращает True при успехе, False при ошибке.
     """
     try:
@@ -69,8 +69,9 @@ def write_file_logging_flag(val: bool) -> bool:
                 j = {}
         # сохраняем/устанавливаем поля
         if "enabled" not in j:
-            # если нет enabled — оставляем True по умолчанию
             j["enabled"] = True
+        if "autorun" not in j:
+            j["autorun"] = False
         j["file_logging"] = bool(val)
         with open(CONFIG_FILE, "w", encoding="utf-8") as f:
             json.dump(j, f, ensure_ascii=False, indent=2)
@@ -80,13 +81,129 @@ def write_file_logging_flag(val: bool) -> bool:
         logger.exception("config: не удалось записать file_logging в %s", CONFIG_FILE)
         return False
 
-class FileLoggingFilter(logging.Filter):
-    """Фильтр для file_handler — пускает запись в файл только если flag в config True"""
-    def filter(self, record: logging.LogRecord) -> bool:
-        try:
-            return read_file_logging_flag()
-        except Exception:
+def read_autorun_flag() -> bool:
+    """
+    Читает CONFIG_FILE и возвращает булево поле autorun.
+    Если файла нет или парсинг не удался — возвращает False.
+    """
+    try:
+        if not os.path.isfile(CONFIG_FILE):
             return False
+        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+            j = json.load(f)
+        return bool(j.get("autorun", False))
+    except Exception:
+        return False
+
+def write_autorun_flag(val: bool) -> bool:
+    """
+    Записывает флаг autorun в CONFIG_FILE, оставляя при этом поля enabled/file_logging, если они есть.
+    Возвращает True при успехе, False при ошибке.
+    """
+    try:
+        j = {}
+        if os.path.isfile(CONFIG_FILE):
+            try:
+                with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                    j = json.load(f)
+            except Exception:
+                j = {}
+        if "enabled" not in j:
+            j["enabled"] = True
+        if "file_logging" not in j:
+            j["file_logging"] = False
+        j["autorun"] = bool(val)
+        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump(j, f, ensure_ascii=False, indent=2)
+        logger.info("config: записан autorun=%s в %s", j["autorun"], CONFIG_FILE)
+        return True
+    except Exception:
+        logger.exception("config: не удалось записать autorun в %s", CONFIG_FILE)
+        return False
+
+# ---------------- startup shortcut helpers ----------------
+def _startup_shortcut_path() -> str:
+    """
+    Возвращает путь к .lnk в папке автозагрузки текущего пользователя.
+    """
+    appdata = os.environ.get("APPDATA")
+    if not appdata:
+        # на всякий случай fallback
+        appdata = os.path.expanduser("~\\AppData\\Roaming")
+    startup_dir = os.path.join(appdata, "Microsoft", "Windows", "Start Menu", "Programs", "Startup")
+    return os.path.join(startup_dir, f"{APP_NAME}.lnk")
+
+def create_startup_shortcut() -> bool:
+    """
+    Создаёт ярлык в папке автозагрузки. Возвращает True при успехе.
+    Ярлык указывает на python-исполняемый файл и передаёт скрипт (или exe) как аргумент.
+    """
+    shortcut_path = _startup_shortcut_path()
+    try:
+        # Отдельно импортируем win32com, чтобы не падать при наличии pywin32 но без COM (редко)
+        try:
+            import win32com.client  # type: ignore
+        except Exception:
+            logger.exception("create_startup_shortcut: win32com.client недоступен, не могу создать ярлык")
+            return False
+
+        shell = win32com.client.Dispatch("WScript.Shell")
+        shortcut = shell.CreateShortcut(shortcut_path)
+        # Если приложение собрано в exe (pyinstaller), sys.executable указывает на exe.
+        # Иначе — указываем на интерпретатор и добавляем путь к скрипту в Arguments.
+        target = sys.executable
+        script = os.path.abspath(sys.argv[0])
+        # Если исполняемый файл - python.exe/wpython, передаём скрипт в аргументах.
+        shortcut.TargetPath = target
+        # аргументы — скрипт в кавычках, если это .py
+        if script.endswith(".py") or script.endswith(".pyw"):
+            shortcut.Arguments = f'"{script}"'
+        else:
+            # возможно уже exe — не передаём аргументы
+            shortcut.Arguments = ""
+        shortcut.WorkingDirectory = BASE_DIR
+        # Иконка: используем ICON_ON если есть, иначе сам exe
+        if os.path.isfile(ICON_ON):
+            shortcut.IconLocation = ICON_ON
+        else:
+            shortcut.IconLocation = target
+        shortcut.Save()
+        logger.info("startup: ярлык создан: %s", shortcut_path)
+        return True
+    except Exception:
+        logger.exception("startup: не удалось создать ярлык автозагрузки")
+        return False
+
+def remove_startup_shortcut() -> bool:
+    """
+    Удаляет ярлык из автозагрузки, если он существует.
+    """
+    sp = _startup_shortcut_path()
+    try:
+        if os.path.isfile(sp):
+            os.remove(sp)
+            logger.info("startup: ярлык удалён: %s", sp)
+        else:
+            logger.debug("startup: ярлык не найден: %s", sp)
+        return True
+    except Exception:
+        logger.exception("startup: не удалось удалить ярлык: %s", sp)
+        return False
+
+def apply_autorun_setting() -> None:
+    """
+    Применяет текущее значение autorun (читая из файла) — создаёт или удаляет ярлык.
+    Вызывать на старте и при переключении через меню.
+    """
+    logger.warning("AUTORUN: apply_autorun_setting CALLED")
+
+    try:
+        if read_autorun_flag():
+            create_startup_shortcut()
+        else:
+            remove_startup_shortcut()
+    except Exception:
+        logger.exception("apply_autorun_setting: ошибка при применении autorun")
 
 # --- Один экземпляр (mutex) ---
 mutex_handle = win32event.CreateMutex(None, False, MUTEX_NAME)
@@ -106,6 +223,14 @@ fmt = logging.Formatter("%(asctime)s %(levelname)s [%(threadName)s] %(message)s"
 handler.setFormatter(fmt)
 
 # прикрепляем фильтр, который читает CONFIG_FILE при каждом лог-записи
+class FileLoggingFilter(logging.Filter):
+    """Фильтр для file_handler — пускает запись в файл только если flag в config True"""
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            return read_file_logging_flag()
+        except Exception:
+            return False
+
 handler.addFilter(FileLoggingFilter())
 
 logger.addHandler(handler)
@@ -316,6 +441,7 @@ def safe_restore_clipboard(old_clip: Optional[str]) -> None:
     except Exception as e:
         logger.exception("safe_restore_clipboard: не удалось восстановить буфер: %s", e)
 
+
 def safe_copy_from_selection(timeout_per_attempt: float = 0.6, max_attempts: int = 2) -> str:
     """
     Бережное копирование выделения:
@@ -524,7 +650,7 @@ def load_config():
     """
     Загружает keyflip.json.
     Если файла нет — создаёт с дефолтами.
-    Если нет file_logging — добавляет его.
+    Если нет file_logging/autorun — добавляет их.
     """
     global _enabled
 
@@ -551,6 +677,11 @@ def load_config():
     # file_logging
     if "file_logging" not in j:
         j["file_logging"] = False
+        changed = True
+
+    # autorun
+    if "autorun" not in j:
+        j["autorun"] = False
         changed = True
 
     if changed:
@@ -584,6 +715,11 @@ def set_enabled(val: bool):
 
 # Load config on startup
 load_config()
+# Применяем autorun согласно настройке в файле (если пользователь вручную изменил файл)
+try:
+    apply_autorun_setting()
+except Exception:
+    logger.exception("startup: apply_autorun_setting on startup failed")
 
 # ------------ Hotkey constants & thread messaging ------------
 HOTKEY_ID_F4 = 1
@@ -844,6 +980,20 @@ def toggle_file_logging(icon, item):
     except Exception:
         logger.exception("toggle_file_logging: исключение")
 
+def toggle_autorun(icon, item):
+    """Переключает автозапуск при старте Windows (меняет autorun в keyflip.json и применяет)"""
+    try:
+        current = read_autorun_flag()
+        new = not current
+        ok = write_autorun_flag(new)
+        if ok:
+            logger.info("Tray: autorun toggled -> %s", new)
+            apply_autorun_setting()
+        else:
+            logger.warning("Tray: autorun toggle attempted but write failed")
+    except Exception:
+        logger.exception("toggle_autorun: исключение")
+
 def on_exit(icon=None, item=None):
     logger.info("Выход запрошен (через трей/F10)")
     exit_event.set()
@@ -862,14 +1012,14 @@ def on_exit(icon=None, item=None):
 def tray_worker():
     img = prepare_tray_icon_image()
 
+    # settings menu: добавляем чекбоксы, которые читают флаги из файла при отображении
     settings_menu = Menu(
-        MenuItem(
-            "Логирование в файл", toggle_file_logging,
-            checked=lambda item: read_file_logging_flag()),  # чекбокс: проверка берётся прямо из файла при показе
+        MenuItem("Логирование в файл", toggle_file_logging, checked=lambda item: read_file_logging_flag()),
+        MenuItem("Автозапуск при старте Windows", toggle_autorun, checked=lambda item: read_autorun_flag()),
     )
     menu = Menu(
-        MenuItem("Настройки", settings_menu),
         MenuItem(enabled_menu_text, toggle_enabled),
+        MenuItem("Настройки", settings_menu),
         MenuItem("Выход", on_exit)
     )
     icon = Icon(APP_NAME, img, APP_NAME, menu=menu)
@@ -896,7 +1046,7 @@ def win_hotkey_loop():
         HOTKEY_THREAD_ID = 0
         logger.exception("win_hotkey_loop: failed to get thread id")
 
-    # Register F10 always (for exit) — делаем это в этом потоке
+    # Register F10 всегда (для выхода) — делаем это в этом потоке
     if not user32.RegisterHotKey(None, HOTKEY_ID_F10, MOD_NONE, VK_F10):
         logger.error("Не удалось зарегистрировать F10 через RegisterHotKey")
     else:
