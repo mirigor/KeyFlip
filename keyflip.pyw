@@ -1,5 +1,3 @@
-# keyflip_winapi.py
-from __future__ import annotations
 import ctypes
 import json
 import logging
@@ -9,7 +7,7 @@ import threading
 import time
 import uuid
 from logging.handlers import RotatingFileHandler
-from typing import Dict, Optional, Tuple
+from typing import Optional
 
 # внешние библиотеки
 try:
@@ -40,6 +38,30 @@ ICON_ON = os.path.join(BASE_DIR, "icon_on.ico")
 ICON_OFF = os.path.join(BASE_DIR, "icon_off.ico")
 CONFIG_FILE = os.path.join(BASE_DIR, "keyflip.json")
 
+def read_file_logging_flag() -> bool:
+    """
+    Читает CONFIG_FILE и возвращает булево поле file_logging.
+    Если файла нет или парсинг не удался — возвращает False.
+    Вызывается при каждой попытке запись в файловый handler.
+    """
+    try:
+        if not os.path.isfile(CONFIG_FILE):
+            return False
+        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+            j = json.load(f)
+        return bool(j.get("file_logging", False))
+    except Exception:
+        # в случае ошибок считаем file logging выключенным
+        return False
+
+class FileLoggingFilter(logging.Filter):
+    """Фильтр для file_handler — пускает запись в файл только если flag в config True."""
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            return read_file_logging_flag()
+        except Exception:
+            return False
+
 # --- Один экземпляр (mutex) ---
 mutex_handle = win32event.CreateMutex(None, False, MUTEX_NAME)
 ERROR_ALREADY_EXISTS = 183
@@ -56,6 +78,10 @@ logger.setLevel(logging.DEBUG)
 handler = RotatingFileHandler(LOG_FILE, maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8")
 fmt = logging.Formatter("%(asctime)s %(levelname)s [%(threadName)s] %(message)s", "%Y-%m-%d %H:%M:%S")
 handler.setFormatter(fmt)
+
+# прикрепляем фильтр, который читает CONFIG_FILE при каждом лог-записи
+handler.addFilter(FileLoggingFilter())
+
 logger.addHandler(handler)
 console = logging.StreamHandler(sys.stdout)
 console.setFormatter(fmt)
@@ -64,7 +90,7 @@ logger.addHandler(console)
 logger.info("%s запуск — лог: %s", APP_NAME, LOG_FILE)
 
 # ------------ Mapping: explicit, детерминированные таблицы ------------
-EN_TO_RU: Dict[str, str] = {
+EN_TO_RU: dict[str, str] = {
     # letters
     'q': 'й', 'w': 'ц', 'e': 'у', 'r': 'к', 't': 'е', 'y': 'н', 'u': 'г', 'i': 'ш', 'o': 'щ', 'p': 'з',
     'a': 'ф', 's': 'ы', 'd': 'в', 'f': 'а', 'g': 'п', 'h': 'р', 'j': 'о', 'k': 'л', 'l': 'д',
@@ -101,7 +127,7 @@ for k, v in list(EN_TO_RU.items()):
         EN_TO_RU[k.upper()] = v.upper()
 
 # RU -> EN (обратная таблица)
-RU_TO_EN: Dict[str, str] = {v: k for k, v in EN_TO_RU.items()}
+RU_TO_EN: dict[str, str] = {v: k for k, v in EN_TO_RU.items()}
 RU_TO_EN['ё'] = '`'
 RU_TO_EN['Ё'] = '~'
 
@@ -134,7 +160,7 @@ def transform_text_by_keyboard_layout_based_on_hkl(s: str, hkl: int) -> str:
     return ''.join(out)
 
 # ------------ Active window info ------------
-def get_active_window_info() -> Tuple[str, int, Optional[str]]:
+def get_active_window_info() -> tuple[str, int, Optional[str]]:
     try:
         hwnd = user32.GetForegroundWindow()
     except Exception:  # noqa
@@ -469,17 +495,45 @@ _enabled_lock = threading.Lock()
 _enabled: bool = True  # default; will be overwritten by load_config()
 
 def load_config():
+    """
+    Загружает keyflip.json.
+    Если файла нет — создаёт с дефолтами.
+    Если нет file_logging — добавляет его.
+    """
     global _enabled
-    try:
-        # При старте всегда включаем функционал (enabled=True) и сохраняем это в файл.
-        with _enabled_lock:
-            _enabled = True
-        save_config()
-        logger.debug("config: startup forced enabled=True (config saved)")
-    except Exception:  # noqa
-        logger.exception("config: forced enable on startup failed; using default enabled=True")
-        with _enabled_lock:
-            _enabled = True
+
+    changed = False
+
+    if os.path.isfile(CONFIG_FILE):
+        try:
+            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                j = json.load(f)
+        except Exception:
+            j = {}
+            changed = True
+    else:
+        j = {}
+        changed = True
+
+    # enabled
+    if "enabled" not in j:
+        j["enabled"] = True
+        changed = True
+
+    _enabled = bool(j["enabled"])
+
+    # file_logging
+    if "file_logging" not in j:
+        j["file_logging"] = False
+        changed = True
+
+    if changed:
+        try:
+            with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+                json.dump(j, f, ensure_ascii=False, indent=2)
+        except Exception:
+            logger.exception("config: failed to write %s", CONFIG_FILE)
+
 
 def save_config():
     try:
