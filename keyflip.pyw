@@ -13,7 +13,7 @@ from typing import Optional
 try:
     import pyperclip
     from PIL import Image, ImageDraw
-    import pystray
+    from pystray import Menu, MenuItem, Icon
     import psutil
     import win32event, win32api, win32con
 except Exception:  # noqa
@@ -42,7 +42,7 @@ def read_file_logging_flag() -> bool:
     """
     Читает CONFIG_FILE и возвращает булево поле file_logging.
     Если файла нет или парсинг не удался — возвращает False.
-    Вызывается при каждой попытке запись в файловый handler.
+    Вызывается при каждой попытке записи в файловый handler.
     """
     try:
         if not os.path.isfile(CONFIG_FILE):
@@ -54,8 +54,34 @@ def read_file_logging_flag() -> bool:
         # в случае ошибок считаем file logging выключенным
         return False
 
+def write_file_logging_flag(val: bool) -> bool:
+    """
+    Записывает флаг file_logging в CONFIG_FILE, оставляя при этом поле enabled, если оно есть.
+    Возвращает True при успехе, False при ошибке.
+    """
+    try:
+        j = {}
+        if os.path.isfile(CONFIG_FILE):
+            try:
+                with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                    j = json.load(f)
+            except Exception:
+                j = {}
+        # сохраняем/устанавливаем поля
+        if "enabled" not in j:
+            # если нет enabled — оставляем True по умолчанию
+            j["enabled"] = True
+        j["file_logging"] = bool(val)
+        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump(j, f, ensure_ascii=False, indent=2)
+        logger.info("config: записан file_logging=%s в %s", j["file_logging"], CONFIG_FILE)
+        return True
+    except Exception:
+        logger.exception("config: не удалось записать file_logging в %s", CONFIG_FILE)
+        return False
+
 class FileLoggingFilter(logging.Filter):
-    """Фильтр для file_handler — пускает запись в файл только если flag в config True."""
+    """Фильтр для file_handler — пускает запись в файл только если flag в config True"""
     def filter(self, record: logging.LogRecord) -> bool:
         try:
             return read_file_logging_flag()
@@ -247,7 +273,7 @@ SendInput.argtypes = (wintypes.UINT, ctypes.POINTER(INPUT), ctypes.c_int)
 SendInput.restype = wintypes.UINT
 
 def send_unicode_via_sendinput(text: str, delay_between_keys: float = 0.001):
-    """Посылает символы через SendInput (UNICODE). Без использования буфера обмена."""
+    """Посылает символы через SendInput (UNICODE). Без использования буфера обмена"""
     if not text:
         return
 
@@ -279,7 +305,7 @@ def send_unicode_via_sendinput(text: str, delay_between_keys: float = 0.001):
 
 # ------------ Clipboard helper (бережно) ------------
 def safe_restore_clipboard(old_clip: Optional[str]) -> None:
-    """Оставлена для совместимости; но по умолчанию мы НЕ восстанавливаем старый буфер."""
+    """Оставлена для совместимости; но по умолчанию мы НЕ восстанавливаем старый буфер"""
     try:
         if old_clip is None:
             pyperclip.copy('')
@@ -575,7 +601,7 @@ MSG_UNREGISTER_F4 = WM_USER + 2
 HOTKEY_THREAD_ID = 0  # заполнится в win_hotkey_loop
 
 def post_register_f4(should_register: bool):
-    """Посылает сообщение потоку hotkey чтобы тот зарегистрировал/удалил F4."""
+    """Посылает сообщение потоку hotkey чтобы тот зарегистрировал/удалил F4"""
     global HOTKEY_THREAD_ID
     if HOTKEY_THREAD_ID == 0:
         logger.warning("post_register_f4: HOTKEY_THREAD_ID not ready yet -> cannot post")
@@ -783,11 +809,10 @@ def prepare_tray_icon_image(enabled: Optional[bool] = None) -> Image.Image:
     return img
 
 def enabled_menu_text(item):
-    # item аргумент необходим pystray (menu passes it). Возвращаем текст с эмодзи.
     return "❌ Выключить" if is_enabled() else "✅ Включить"
 
 def toggle_enabled(icon, item):
-    """Action called from tray menu: flips state, updates config and icon image immediately."""
+    """Action called from tray menu: flips state, updates config and icon image immediately"""
     new_state = not is_enabled()
     set_enabled(new_state)
     logger.info("Tray: toggled enabled -> %s", new_state)
@@ -806,6 +831,19 @@ def toggle_enabled(icon, item):
     except Exception:  # noqa
         logger.exception("Tray: failed to update icon image after toggle")
 
+def toggle_file_logging(icon, item):
+    """Переключает запись логов в файл (меняет file_logging в keyflip.json)"""
+    try:
+        current = read_file_logging_flag()
+        new = not current
+        ok = write_file_logging_flag(new)
+        if ok:
+            logger.info("Tray: file_logging toggled -> %s", new)
+        else:
+            logger.warning("Tray: file_logging toggle attempted but write failed")
+    except Exception:
+        logger.exception("toggle_file_logging: исключение")
+
 def on_exit(icon=None, item=None):
     logger.info("Выход запрошен (через трей/F10)")
     exit_event.set()
@@ -823,12 +861,18 @@ def on_exit(icon=None, item=None):
 
 def tray_worker():
     img = prepare_tray_icon_image()
-    # menu: state toggle + exit
-    menu = pystray.Menu(
-        pystray.MenuItem(enabled_menu_text, toggle_enabled),
-        pystray.MenuItem("Выход", on_exit)
+
+    settings_menu = Menu(
+        MenuItem(
+            "Логирование в файл", toggle_file_logging,
+            checked=lambda item: read_file_logging_flag()),  # чекбокс: проверка берётся прямо из файла при показе
     )
-    icon = pystray.Icon(APP_NAME, img, APP_NAME, menu=menu)
+    menu = Menu(
+        MenuItem("Настройки", settings_menu),
+        MenuItem(enabled_menu_text, toggle_enabled),
+        MenuItem("Выход", on_exit)
+    )
+    icon = Icon(APP_NAME, img, APP_NAME, menu=menu)
     # ensure icon image matches saved state (in case load_config changed it earlier)
     try:
         icon.icon = prepare_tray_icon_image(is_enabled())
