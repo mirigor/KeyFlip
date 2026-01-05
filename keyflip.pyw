@@ -1,3 +1,6 @@
+# keyflip.pyw
+# Полный рабочий файл KeyFlip с возможностью менять хоткей выхода через диалог
+
 import ctypes
 import json
 import logging
@@ -29,6 +32,12 @@ user32 = ctypes.windll.user32
 kernel32 = ctypes.windll.kernel32
 from ctypes import wintypes
 
+# ensure ULONG_PTR available on wintypes
+try:
+    wintypes.ULONG_PTR
+except Exception:
+    wintypes.ULONG_PTR = wintypes.WPARAM
+
 # --- Константы / пути ---
 APP_NAME = "KeyFlip"
 MUTEX_NAME = r"Global\KeyFlipMutex"
@@ -38,14 +47,8 @@ ICON_ON = os.path.join(BASE_DIR, "icon_on.ico")
 ICON_OFF = os.path.join(BASE_DIR, "icon_off.ico")
 CONFIG_FILE = os.path.join(BASE_DIR, "keyflip.json")
 
-# --- Пару глобальных помощников для безопасности при записи/чтении конфига ---
-_config_write_lock = threading.Lock()  # защищает запись в файл
-_config_cache_lock = threading.Lock()
-_config_cache: Optional[dict] = None
-_config_cache_mtime: float = 0.0
-
-def _read_config_raw() -> dict:
-    """Прочитать JSON файл (не использую кэш) — возвращает {} при ошибках."""
+# ------------------ Config helpers for file_logging / autorun / exit_hotkey ------------------
+def read_json_config() -> dict:
     try:
         if not os.path.isfile(CONFIG_FILE):
             return {}
@@ -54,88 +57,192 @@ def _read_config_raw() -> dict:
     except Exception:
         return {}
 
-def _reload_config_if_needed() -> dict:
-    """
-    Возвращает кэшированный config dict. Перезагружает, если файл изменился по mtime
-    или если кэша ещё нет.
-    """
-    global _config_cache, _config_cache_mtime
+def write_json_config(j: dict) -> bool:
     try:
-        with _config_cache_lock:
-            if not os.path.isfile(CONFIG_FILE):
-                # файл отсутствует — сброс кэша
-                if _config_cache is None:
-                    _config_cache = {}
-                    _config_cache_mtime = 0.0
-                return dict(_config_cache)
-            m = os.path.getmtime(CONFIG_FILE)
-            if _config_cache is None or m != _config_cache_mtime:
-                # reload
-                try:
-                    with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-                        j = json.load(f) or {}
-                except Exception:
-                    j = {}
-                _config_cache = j
-                _config_cache_mtime = m
-            return dict(_config_cache)
-    except Exception:
-        return {}
-
-def _atomic_write_json(path: str, obj: dict) -> bool:
-    """
-    Атомарно записывает JSON: пишем в временный файл, flush+fsync, затем os.replace.
-    Возвращает True при успехе.
-    """
-    tmp = path + ".tmp"
-    try:
+        # atomic-ish write: write to temp and replace
+        tmp = CONFIG_FILE + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(obj, f, ensure_ascii=False, indent=2)
-            f.flush()
-            try:
-                os.fsync(f.fileno())
-            except Exception:
-                # на некоторых файловых системах может не сработать, но это ок
-                pass
-        os.replace(tmp, path)
-        # обновим кэш
+            json.dump(j, f, ensure_ascii=False, indent=2)
         try:
-            with _config_cache_lock:
-                _config_cache = obj.copy()
-                _config_cache_mtime = os.path.getmtime(path)
+            os.replace(tmp, CONFIG_FILE)
         except Exception:
-            pass
+            # fallback
+            os.remove(CONFIG_FILE) if os.path.exists(CONFIG_FILE) else None
+            os.rename(tmp, CONFIG_FILE)
         return True
     except Exception:
-        try:
-            if os.path.exists(tmp):
-                os.remove(tmp)
-        except Exception:
-            pass
+        logger.exception("config: write_json_config failed")
         return False
 
-# --- Один экземпляр (mutex) ---
+def read_file_logging_flag() -> bool:
+    try:
+        j = read_json_config()
+        return bool(j.get("file_logging", False))
+    except Exception:
+        return False
+
+def write_file_logging_flag(val: bool) -> bool:
+    try:
+        j = read_json_config()
+        if "enabled" not in j:
+            j["enabled"] = True
+        if "autorun" not in j:
+            j["autorun"] = False
+        j["file_logging"] = bool(val)
+        ok = write_json_config(j)
+        if ok:
+            logger.info("config: записан file_logging=%s", j["file_logging"])
+        return ok
+    except Exception:
+        logger.exception("config: write_file_logging_flag failed")
+        return False
+
+def read_autorun_flag() -> bool:
+    try:
+        j = read_json_config()
+        return bool(j.get("autorun", False))
+    except Exception:
+        return False
+
+def write_autorun_flag(val: bool) -> bool:
+    try:
+        j = read_json_config()
+        if "enabled" not in j:
+            j["enabled"] = True
+        if "file_logging" not in j:
+            j["file_logging"] = False
+        j["autorun"] = bool(val)
+        ok = write_json_config(j)
+        if ok:
+            logger.info("config: записан autorun=%s", j["autorun"])
+        return ok
+    except Exception:
+        logger.exception("config: write_autorun_flag failed")
+        return False
+
+# exit_hotkey helpers
+def default_exit_hotkey() -> Dict:
+    return {"modifiers": [], "key": "F10"}
+
+def read_exit_hotkey() -> Dict:
+    try:
+        j = read_json_config()
+        eh = j.get("exit_hotkey")
+        if not isinstance(eh, dict):
+            return default_exit_hotkey()
+        mods = eh.get("modifiers", []) or []
+        key = eh.get("key", "F10") or "F10"
+        return {"modifiers": list(mods), "key": str(key)}
+    except Exception:
+        return default_exit_hotkey()
+
+def write_exit_hotkey(modifiers: List[str], key: str) -> bool:
+    try:
+        j = read_json_config()
+        if "enabled" not in j:
+            j["enabled"] = True
+        if "file_logging" not in j:
+            j["file_logging"] = False
+        if "autorun" not in j:
+            j["autorun"] = False
+        # normalise modifiers to uppercase short names
+        mods = []
+        for m in modifiers or []:
+            mm = (m or "").upper()
+            if mm in ("CTRL", "CONTROL"):
+                mods.append("CTRL")
+            elif mm in ("ALT", "MENU"):
+                mods.append("ALT")
+            elif mm in ("SHIFT",):
+                mods.append("SHIFT")
+            elif mm in ("WIN", "WINDOWS"):
+                mods.append("WIN")
+        j["exit_hotkey"] = {"modifiers": mods, "key": str(key)}
+        ok = write_json_config(j)
+        if ok:
+            logger.info("config: записан exit_hotkey=%s", j["exit_hotkey"])
+        return ok
+    except Exception:
+        logger.exception("config: write_exit_hotkey failed")
+        return False
+
+# ---------------- startup shortcut helpers (autorun) ----------------
+def _startup_shortcut_path() -> str:
+    appdata = os.environ.get("APPDATA") or os.path.expanduser("~\\AppData\\Roaming")
+    startup_dir = os.path.join(appdata, "Microsoft", "Windows", "Start Menu", "Programs", "Startup")
+    return os.path.join(startup_dir, f"{APP_NAME}.lnk")
+
+def create_startup_shortcut() -> bool:
+    shortcut_path = _startup_shortcut_path()
+    try:
+        import win32com.client  # type: ignore
+        shell = win32com.client.Dispatch("WScript.Shell")
+        shortcut = shell.CreateShortcut(shortcut_path)
+        target = sys.executable
+        script = os.path.abspath(sys.argv[0])
+        shortcut.TargetPath = target
+        if script.endswith(".py") or script.endswith(".pyw"):
+            shortcut.Arguments = f'"{script}"'
+        else:
+            shortcut.Arguments = ""
+        shortcut.WorkingDirectory = BASE_DIR
+        if os.path.isfile(ICON_ON):
+            shortcut.IconLocation = ICON_ON
+        else:
+            shortcut.IconLocation = target
+        shortcut.Save()
+        logger.info("startup: ярлык создан: %s", shortcut_path)
+        return True
+    except Exception:
+        logger.exception("startup: не удалось создать ярлык автозагрузки")
+        return False
+
+def remove_startup_shortcut() -> bool:
+    sp = _startup_shortcut_path()
+    try:
+        if os.path.isfile(sp):
+            os.remove(sp)
+            logger.info("startup: ярлык удалён: %s", sp)
+        else:
+            logger.debug("startup: ярлык не найден: %s", sp)
+        return True
+    except Exception:
+        logger.exception("startup: не удалось удалить ярлык: %s", sp)
+        return False
+
+def apply_autorun_setting() -> None:
+    try:
+        logger.warning("AUTORUN: apply_autorun_setting CALLED")
+        if read_autorun_flag():
+            create_startup_shortcut()
+        else:
+            remove_startup_shortcut()
+    except Exception:
+        logger.exception("apply_autorun_setting: ошибка при применении autorun")
+
+# ------------------ Один экземпляр (mutex) ------------------
 mutex_handle = win32event.CreateMutex(None, False, MUTEX_NAME)
 ERROR_ALREADY_EXISTS = 183
 if win32api.GetLastError() == ERROR_ALREADY_EXISTS:
     try:
         win32api.MessageBox(0, f"Программа {APP_NAME} уже запущена!", APP_NAME, 0)
-    except Exception:  # noqa
+    except Exception:
         print(f"{APP_NAME} уже запущена!")
     sys.exit(0)
 
-# --- Логирование ---
+# ------------------ Логирование ------------------
 logger = logging.getLogger(APP_NAME)
 logger.setLevel(logging.DEBUG)
 handler = RotatingFileHandler(LOG_FILE, maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8")
 fmt = logging.Formatter("%(asctime)s %(levelname)s [%(threadName)s] %(message)s", "%Y-%m-%d %H:%M:%S")
 handler.setFormatter(fmt)
 
-# Фильтр: файл логов включается/выключается флагом в CONFIG_FILE
 class FileLoggingFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
-        cfg = _reload_config_if_needed()
-        return bool(cfg.get("file_logging", False))
+        try:
+            return read_file_logging_flag()
+        except Exception:
+            return False
 
 handler.addFilter(FileLoggingFilter())
 
@@ -146,7 +253,7 @@ console.setLevel(logging.INFO)
 logger.addHandler(console)
 logger.info("%s запуск — лог: %s", APP_NAME, LOG_FILE)
 
-# ------------ Mapping: explicit, детерминированные таблицы ------------
+# ---------------- Mapping tables (EN<->RU) ----------------
 EN_TO_RU: Dict[str, str] = {
     # letters
     'q': 'й', 'w': 'ц', 'e': 'у', 'r': 'к', 't': 'е', 'y': 'н', 'u': 'г', 'i': 'ш', 'o': 'щ', 'p': 'з',
@@ -208,18 +315,18 @@ def transform_text_by_keyboard_layout_based_on_hkl(s: str, hkl: int) -> str:
     logger.debug("transform: used %s mapping", prefer)
     return ''.join(out)
 
-# ------------ Active window info ------------
+# ---------------- Active window info ----------------
 def get_active_window_info() -> Tuple[str, int, Optional[str]]:
     try:
         hwnd = user32.GetForegroundWindow()
-    except Exception:  # noqa
+    except Exception:
         return "<unknown>", 0, None
     try:
         length = user32.GetWindowTextLengthW(hwnd)
         buff = ctypes.create_unicode_buffer(length + 1)
         user32.GetWindowTextW(hwnd, buff, length + 1)
         title = buff.value
-    except Exception:  # noqa
+    except Exception:
         title = "<unknown>"
     pid = 0
     proc_name = None
@@ -231,13 +338,13 @@ def get_active_window_info() -> Tuple[str, int, Optional[str]]:
             try:
                 proc = psutil.Process(pid)
                 proc_name = proc.name()
-            except Exception:  # noqa
+            except Exception:
                 proc_name = None
-    except Exception:  # noqa
+    except Exception:
         pass
     return title, pid, proc_name
 
-# ------------ Helper: эмуляция клавиш через keybd_event ------------
+# ---------------- keyboard emulation helpers ----------------
 def _key_down(vk: int):
     user32.keybd_event(vk, 0, 0, 0)
 
@@ -267,7 +374,7 @@ def send_delete():
     time.sleep(0.01)
     _key_up(VK_DELETE)
 
-# ------------ Send Unicode via SendInput (не трогает clipboard) ------------
+# ---------------- SendInput UNICODE ----------------
 INPUT_KEYBOARD = 1
 KEYEVENTF_UNICODE = 0x0004
 KEYEVENTF_KEYUP = 0x0002
@@ -315,18 +422,7 @@ def send_unicode_via_sendinput(text: str, delay_between_keys: float = 0.001):
     if delay_between_keys > 0:
         time.sleep(delay_between_keys)
 
-# ------------ Clipboard helper (бережно) ------------
-def safe_restore_clipboard(old_clip: Optional[str]) -> None:
-    try:
-        if old_clip is None:
-            pyperclip.copy('')
-            logger.debug("safe_restore_clipboard: восстановлен пустой буфер")
-        else:
-            pyperclip.copy(old_clip)
-            logger.debug("safe_restore_clipboard: буфер восстановлен (len=%s)", len(old_clip))
-    except Exception as e:
-        logger.exception("safe_restore_clipboard: не удалось восстановить буфер: %s", e)
-
+# ---------------- Clipboard helpers (safe copy) ----------------
 def safe_copy_from_selection(timeout_per_attempt: float = 0.6, max_attempts: int = 2) -> str:
     title, pid, proc_name = get_active_window_info()
     logger.debug("safe_copy: start. active window: %r pid=%s proc=%r", title, pid, proc_name)
@@ -339,7 +435,7 @@ def safe_copy_from_selection(timeout_per_attempt: float = 0.6, max_attempts: int
         try:
             cur = user32.GetForegroundWindow()
             return initial_hwnd is not None and cur is not None and cur != initial_hwnd
-        except Exception:  # noqa
+        except Exception:
             return False
     try:
         old_seq = user32.GetClipboardSequenceNumber()
@@ -365,7 +461,7 @@ def safe_copy_from_selection(timeout_per_attempt: float = 0.6, max_attempts: int
                     return ""
                 try:
                     seq = user32.GetClipboardSequenceNumber()
-                except Exception:  # noqa
+                except Exception:
                     seq = None
                 if seq is not None and seq != old_seq:
                     changed = True
@@ -404,7 +500,7 @@ def safe_copy_from_selection(timeout_per_attempt: float = 0.6, max_attempts: int
                     return ""
                 try:
                     seq = user32.GetClipboardSequenceNumber()
-                except Exception:  # noqa
+                except Exception:
                     seq = None
                 if seq is not None and seq != old_seq:
                     changed = True
@@ -424,7 +520,7 @@ def safe_copy_from_selection(timeout_per_attempt: float = 0.6, max_attempts: int
             break
         logger.debug("safe_copy: sequence not changed -> no selection")
         return ""
-    # ---- fallback: sentinel approach ----
+    # ---- fallback sentinel approach ----
     if foreground_changed():
         logger.debug("safe_copy: foreground changed before fallback -> abort")
         return ""
@@ -463,7 +559,7 @@ def safe_copy_from_selection(timeout_per_attempt: float = 0.6, max_attempts: int
             logger.debug("safe_copy: buffer changed (fallback) len=%d", len(cur))
             return cur
         time.sleep(0.02)
-    # last attempt: Ctrl+Insert
+    # last attempt Ctrl+Insert
     if foreground_changed():
         logger.debug("safe_copy: foreground changed before fallback Ctrl+Insert -> abort")
         return ""
@@ -501,60 +597,39 @@ def safe_copy_from_selection(timeout_per_attempt: float = 0.6, max_attempts: int
     logger.warning("safe_copy: НЕ удалось получить выделение. last_exc=%r", repr(last_exception))
     return ""
 
-# ------------ Config (enabled + defaults) ------------
+# ---------------- Config (enabled + defaults) ----------------
 _enabled_lock = threading.Lock()
-_enabled: bool = True  # default; будет перезаписан load_config()
-
-def default_exit_hotkey() -> Dict:
-    return {"modifiers": [], "key": "F10"}
+_enabled: bool = True
 
 def load_config():
-    """
-    Загружает keyflip.json (создаёт с дефолтами, если нет).
-    Устанавливает _enabled и гарантирует, что в файле есть file_logging/autorun/exit_hotkey.
-    """
-    try:
-        j = _read_config_raw()
-        changed = False
-        if "enabled" not in j:
-            j["enabled"] = True
-            changed = True
-        if "file_logging" not in j:
-            j["file_logging"] = False
-            changed = True
-        if "autorun" not in j:
-            j["autorun"] = False
-            changed = True
-        if "exit_hotkey" not in j:
-            j["exit_hotkey"] = default_exit_hotkey()
-            changed = True
-        if changed:
-            # атомарно записываем
-            with _config_write_lock:
-                _atomic_write_json(CONFIG_FILE, j)
-        # применим enabled в память
-        global _enabled
-        with _enabled_lock:
-            _enabled = bool(j.get("enabled", True))
-        # обновим кэш сразу
-        with _config_cache_lock:
-            global _config_cache, _config_cache_mtime
-            _config_cache = j.copy()
-            try:
-                _config_cache_mtime = os.path.getmtime(CONFIG_FILE)
-            except Exception:
-                _config_cache_mtime = 0.0
-    except Exception:
-        logger.exception("config: load_config unexpected exception; using defaults")
-        with _enabled_lock:
-            _enabled = True
+    global _enabled
+    changed = False
+    j = read_json_config()
+    if not j:
+        j = {}
+        changed = True
+    if "enabled" not in j:
+        j["enabled"] = True
+        changed = True
+    _enabled = bool(j["enabled"])
+    if "file_logging" not in j:
+        j["file_logging"] = False
+        changed = True
+    if "autorun" not in j:
+        j["autorun"] = False
+        changed = True
+    if "exit_hotkey" not in j:
+        j["exit_hotkey"] = default_exit_hotkey()
+        changed = True
+    if changed:
+        write_json_config(j)
 
 def save_config():
     try:
         with _enabled_lock:
             j = {"enabled": bool(_enabled)}
-        with _config_write_lock:
-            _atomic_write_json(CONFIG_FILE, j)
+        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump(j, f)
         logger.debug("config: saved enabled=%s to %s", j["enabled"], CONFIG_FILE)
     except Exception:
         logger.exception("config: save failed")
@@ -570,161 +645,17 @@ def set_enabled(val: bool):
     save_config()
     logger.info("state: enabled set to %s", _enabled)
 
-# Функции чтения/записи отдельных флагов используют кэш и атомарную запись
-def read_file_logging_flag() -> bool:
-    cfg = _reload_config_if_needed()
-    return bool(cfg.get("file_logging", False))
-
-def write_file_logging_flag(val: bool) -> bool:
-    with _config_write_lock:
-        j = _reload_config_if_needed()
-        j["file_logging"] = bool(val)
-        # оставляем enabled/autorun/exit_hotkey как есть
-        ok = _atomic_write_json(CONFIG_FILE, j)
-        if ok:
-            logger.info("config: записан file_logging=%s в %s", j["file_logging"], CONFIG_FILE)
-        else:
-            logger.exception("config: не удалось записать file_logging в %s", CONFIG_FILE)
-        return ok
-
-def read_autorun_flag() -> bool:
-    cfg = _reload_config_if_needed()
-    return bool(cfg.get("autorun", False))
-
-def write_autorun_flag(val: bool) -> bool:
-    with _config_write_lock:
-        j = _reload_config_if_needed()
-        j["autorun"] = bool(val)
-        ok = _atomic_write_json(CONFIG_FILE, j)
-        if ok:
-            logger.info("config: записан autorun=%s в %s", j["autorun"], CONFIG_FILE)
-        else:
-            logger.exception("config: не удалось записать autorun в %s", CONFIG_FILE)
-        return ok
-
-def read_exit_hotkey() -> Dict:
-    """
-    Возвращает {"modifiers":[...], "key":"F10"} — без поддержки list-формата.
-    """
-    cfg = _reload_config_if_needed()
-    eh = cfg.get("exit_hotkey")
-    if not isinstance(eh, dict):
-        return default_exit_hotkey()
-    mods = eh.get("modifiers", []) or []
-    key = eh.get("key", "F10") or "F10"
-    return {"modifiers": list(mods), "key": str(key)}
-
-def normalize_modifiers(modifiers: List[str]) -> List[str]:
-    """
-    Нормализует список модификаторов: uppercase, CONTROL->CTRL, убирает дубли, сохраняет порядок.
-    Допустимые: CTRL, ALT, SHIFT, WIN
-    """
-    out = []
-    seen = set()
-    for m in modifiers:
-        if not m:
-            continue
-        mm = str(m).upper()
-        if mm == "CONTROL":
-            mm = "CTRL"
-        if mm == "WINDOWS":
-            mm = "WIN"
-        if mm not in ("CTRL", "ALT", "SHIFT", "WIN"):
-            continue
-        if mm in seen:
-            continue
-        seen.add(mm)
-        out.append(mm)
-    return out
-
-def write_exit_hotkey(modifiers: List[str], key: str) -> bool:
-    """
-    Записывает exit_hotkey в CONFIG_FILE (атомарно). Нормализует модификаторы.
-    """
-    mods = normalize_modifiers(modifiers or [])
-    key = (key or "F10").upper()
-    with _config_write_lock:
-        j = _reload_config_if_needed()
-        j["exit_hotkey"] = {"modifiers": mods, "key": key}
-        ok = _atomic_write_json(CONFIG_FILE, j)
-        if ok:
-            logger.info("config: записан exit_hotkey=%s", j["exit_hotkey"])
-        else:
-            logger.exception("config: не удалось записать exit_hotkey в %s", CONFIG_FILE)
-        return ok
-
-# Load config on startup
+# initial load
 load_config()
-
-# ---------------- startup shortcut helpers ----------------
-def _startup_shortcut_path() -> str:
-    appdata = os.environ.get("APPDATA")
-    if not appdata:
-        appdata = os.path.expanduser("~\\AppData\\Roaming")
-    startup_dir = os.path.join(appdata, "Microsoft", "Windows", "Start Menu", "Programs", "Startup")
-    return os.path.join(startup_dir, f"{APP_NAME}.lnk")
-
-def create_startup_shortcut() -> bool:
-    shortcut_path = _startup_shortcut_path()
-    try:
-        try:
-            import win32com.client  # type: ignore
-        except Exception:
-            logger.exception("create_startup_shortcut: win32com.client недоступен, не могу создать ярлык")
-            return False
-        shell = win32com.client.Dispatch("WScript.Shell")
-        shortcut = shell.CreateShortcut(shortcut_path)
-        target = sys.executable
-        script = os.path.abspath(sys.argv[0])
-        shortcut.TargetPath = target
-        if script.endswith(".py") or script.endswith(".pyw"):
-            shortcut.Arguments = f'"{script}"'
-        else:
-            shortcut.Arguments = ""
-        shortcut.WorkingDirectory = BASE_DIR
-        if os.path.isfile(ICON_ON):
-            shortcut.IconLocation = ICON_ON
-        else:
-            shortcut.IconLocation = target
-        shortcut.Save()
-        logger.info("startup: ярлык создан: %s", shortcut_path)
-        return True
-    except Exception:
-        logger.exception("startup: не удалось создать ярлык автозагрузки")
-        return False
-
-def remove_startup_shortcut() -> bool:
-    sp = _startup_shortcut_path()
-    try:
-        if os.path.isfile(sp):
-            os.remove(sp)
-            logger.info("startup: ярлык удалён: %s", sp)
-        else:
-            logger.debug("startup: ярлык не найден: %s", sp)
-        return True
-    except Exception:
-        logger.exception("startup: не удалось удалить ярлык: %s", sp)
-        return False
-
-def apply_autorun_setting() -> None:
-    logger.warning("AUTORUN: apply_autorun_setting CALLED")
-    try:
-        if read_autorun_flag():
-            create_startup_shortcut()
-        else:
-            remove_startup_shortcut()
-    except Exception:
-        logger.exception("apply_autorun_setting: ошибка при применении autorun")
-
-# Применим autorun при старте
+# apply autorun if needed
 try:
     apply_autorun_setting()
 except Exception:
     logger.exception("startup: apply_autorun_setting on startup failed")
 
-# ------------ Hotkey constants & thread messaging ------------
+# ---------------- Hotkey constants & messaging ----------------
 HOTKEY_ID_F4 = 1
-HOTKEY_ID_EXIT = 2  # id для динамической комбинации выхода
+HOTKEY_ID_EXIT = 2
 MOD_NONE = 0
 
 # We'll use PostThreadMessage to request registration/unregistration in the hotkey thread
@@ -733,7 +664,7 @@ MSG_REGISTER_F4 = WM_USER + 1
 MSG_UNREGISTER_F4 = WM_USER + 2
 MSG_UPDATE_EXIT_HOTKEY = WM_USER + 3
 
-HOTKEY_THREAD_ID = 0  # заполнится в win_hotkey_loop
+HOTKEY_THREAD_ID = 0
 
 def post_register_f4(should_register: bool):
     global HOTKEY_THREAD_ID
@@ -771,7 +702,7 @@ def post_update_exit_hotkey():
         logger.exception("post_update_exit_hotkey: exception while posting")
         return False
 
-# ------------ Hotkey register helpers (used only from hotkey thread) ------------
+# ---------------- Hotkey register helpers ----------------
 def register_f4_in_thread():
     try:
         ok = user32.RegisterHotKey(None, HOTKEY_ID_F4, MOD_NONE, 0x73)  # F4 VK = 0x73
@@ -793,18 +724,17 @@ def unregister_f4_in_thread():
     except Exception:
         logger.exception("unregister_f4: exception while unregistering F4")
 
-# ------------- Exit hotkey helpers (dynamic) ----------------
+# ------------- Exit hotkey (dynamic registration) ----------------
 # Modifiers masks for RegisterHotKey
 MOD_ALT = 0x0001
 MOD_CONTROL = 0x0002
 MOD_SHIFT = 0x0004
 MOD_WIN = 0x0008
 
-# map textual names to VK codes for common keys
 VK_MAP = {
     "F1": 0x70, "F2": 0x71, "F3": 0x72, "F4": 0x73, "F5": 0x74, "F6": 0x75,
     "F7": 0x76, "F8": 0x77, "F9": 0x78, "F10": 0x79, "F11": 0x7A, "F12": 0x7B,
-    "ESC": 0x1B, "TAB": 0x09, "RETURN": 0x0D, "ENTER": 0x0D, "SPACE": 0x20,
+    "ESC": 0x1B, "TAB": 0x09, "ENTER": 0x0D, "RETURN": 0x0D, "SPACE": 0x20,
     "INSERT": 0x2D, "DELETE": 0x2E, "HOME": 0x24, "END": 0x23, "PGUP": 0x21, "PGDN": 0x22,
     "LEFT": 0x25, "UP": 0x26, "RIGHT": 0x27, "DOWN": 0x28,
 }
@@ -812,7 +742,7 @@ VK_MAP = {
 def key_name_to_vk(name: str) -> int:
     n = (name or "").upper()
     if not n:
-        return VK_MAP.get("F10", 0x79)
+        return 0x79
     if n in VK_MAP:
         return VK_MAP[n]
     if len(n) == 1:
@@ -826,7 +756,7 @@ def key_name_to_vk(name: str) -> int:
             return int(getattr(win32con, n, 0))
     except Exception:
         pass
-    return VK_MAP.get("F10", 0x79)
+    return 0x79
 
 def modifiers_list_to_mask(mods: List[str]) -> int:
     mask = 0
@@ -864,7 +794,7 @@ def update_exit_hotkey_in_thread():
     except Exception:
         logger.exception("update_exit_hotkey_in_thread: exception")
 
-# ------------ Handler & Hotkey logic ------------
+# ------------------ Handler & transform logic ------------------
 exit_event = threading.Event()
 _handler_lock = threading.Lock()
 _last_f4_ts = 0.0
@@ -973,7 +903,7 @@ def handle_hotkey_transform():
     except Exception as e:
         logger.exception("handle_hotkey_transform: исключение при обработке: %s", e)
 
-# ------------ Tray / Icon (с пунктом Вкл/Выкл и иконками) ----------------
+# ---------------- Tray / Icon ----------------
 def prepare_tray_icon_image(enabled: Optional[bool] = None) -> Image.Image:
     if enabled is None:
         enabled = is_enabled()
@@ -1025,7 +955,7 @@ def toggle_file_logging(icon, item):
         else:
             logger.warning("Tray: file_logging toggle attempted but write failed")
     except Exception:
-        logger.exception("toggle_file_logging: исключение")
+        logger.exception("toggle_file_logging: exception")
 
 def toggle_autorun(icon, item):
     try:
@@ -1038,9 +968,250 @@ def toggle_autorun(icon, item):
         else:
             logger.warning("Tray: autorun toggle attempted but write failed")
     except Exception:
-        logger.exception("toggle_autorun: исключение")
+        logger.exception("toggle_autorun: exception")
 
-# ---- Exit hotkey menu actions
+# ---------------- Hotkey capture (dialog + hook) ----------------
+# We provide a blocking capture function (but we'll run it in a separate thread).
+# It shows a small tkinter dialog telling user to press the desired combo.
+# The hook listens to low-level keyboard events and records the first non-modifier key + active modifiers.
+
+# low-level hook constants
+WH_KEYBOARD_LL = 13
+WM_KEYDOWN = 0x0100
+WM_SYSKEYDOWN = 0x0104
+WM_KEYUP = 0x0101
+WM_SYSKEYUP = 0x0105
+VK_ESCAPE = 0x1B
+
+VK_CONTROL = 0x11
+VK_MENU = 0x12
+VK_SHIFT = 0x10
+VK_LSHIFT = 0xA0
+VK_RSHIFT = 0xA1
+VK_LCONTROL = 0xA2
+VK_RCONTROL = 0xA3
+VK_LMENU = 0xA4
+VK_RMENU = 0xA5
+VK_LWIN = 0x5B
+VK_RWIN = 0x5C
+
+# LRESULT type depending on architecture
+if ctypes.sizeof(ctypes.c_void_p) == 8:
+    LRESULT = ctypes.c_longlong
+else:
+    LRESULT = ctypes.c_long
+
+class KBDLLHOOKSTRUCT(ctypes.Structure):
+    _fields_ = [
+        ("vkCode", wintypes.DWORD),
+        ("scanCode", wintypes.DWORD),
+        ("flags", wintypes.DWORD),
+        ("time", wintypes.DWORD),
+        ("dwExtraInfo", wintypes.ULONG_PTR),
+    ]
+
+# Set argtypes/restype for CallNextHookEx
+user32.SetWindowsHookExW.argtypes = (wintypes.INT, ctypes.c_void_p, wintypes.HINSTANCE, wintypes.DWORD)
+user32.SetWindowsHookExW.restype = wintypes.HHOOK
+user32.UnhookWindowsHookEx.argtypes = (wintypes.HHOOK,)
+user32.UnhookWindowsHookEx.restype = wintypes.BOOL
+user32.CallNextHookEx.argtypes = (wintypes.HHOOK, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM)
+user32.CallNextHookEx.restype = LRESULT
+
+def _vk_is_modifier(vk: int) -> bool:
+    return vk in (
+        VK_CONTROL, VK_MENU, VK_SHIFT,
+        VK_LSHIFT, VK_RSHIFT, VK_LCONTROL, VK_RCONTROL, VK_LMENU, VK_RMENU,
+        VK_LWIN, VK_RWIN
+    )
+
+def _current_modifiers_list() -> list:
+    mods = []
+    try:
+        if user32.GetAsyncKeyState(VK_LCONTROL) & 0x8000 or user32.GetAsyncKeyState(VK_RCONTROL) & 0x8000:
+            mods.append("CTRL")
+        if user32.GetAsyncKeyState(VK_LMENU) & 0x8000 or user32.GetAsyncKeyState(VK_RMENU) & 0x8000:
+            mods.append("ALT")
+        if user32.GetAsyncKeyState(VK_LSHIFT) & 0x8000 or user32.GetAsyncKeyState(VK_RSHIFT) & 0x8000:
+            mods.append("SHIFT")
+        if user32.GetAsyncKeyState(VK_LWIN) & 0x8000 or user32.GetAsyncKeyState(VK_RWIN) & 0x8000:
+            mods.append("WIN")
+    except Exception:
+        pass
+    return mods
+
+def vk_to_key_name(vk: int) -> str:
+    n = None
+    for name, code in VK_MAP.items():
+        if code == vk:
+            n = name
+            break
+    if n:
+        return n
+    if 0x41 <= vk <= 0x5A:
+        return chr(vk)
+    if 0x30 <= vk <= 0x39:
+        return chr(vk)
+    if vk == 0x20:
+        return "SPACE"
+    if vk == 0x0D:
+        return "ENTER"
+    return f"VK_{vk:02X}"
+
+def capture_hotkey_via_hook_blocking(timeout: Optional[float] = 10.0, show_dialog: bool = True) -> Optional[dict]:
+    result = {"modifiers": [], "key": ""}
+    done_event = threading.Event()
+    hook_handle = None
+
+    HOOKPROC = ctypes.WINFUNCTYPE(LRESULT, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM)
+
+    def _low_level_proc(nCode: int, wParam, lParam):
+        nonlocal hook_handle, result, done_event
+        try:
+            if nCode == 0 and (wParam == WM_KEYDOWN or wParam == WM_SYSKEYDOWN):
+                k = ctypes.cast(lParam, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
+                vk = int(k.vkCode)
+                if vk == VK_ESCAPE:
+                    result = None
+                    done_event.set()
+                    return user32.CallNextHookEx(hook_handle, nCode, wParam, lParam)
+                if _vk_is_modifier(vk):
+                    # ignore pure modifier press
+                    return user32.CallNextHookEx(hook_handle, nCode, wParam, lParam)
+                mods = _current_modifiers_list()
+                keyname = vk_to_key_name(vk)
+                result = {"modifiers": mods, "key": keyname}
+                done_event.set()
+                return user32.CallNextHookEx(hook_handle, nCode, wParam, lParam)
+            return user32.CallNextHookEx(hook_handle, nCode, wParam, lParam)
+        except Exception:
+            logger.exception("capture_hotkey: hook proc exception")
+            try:
+                return user32.CallNextHookEx(hook_handle, nCode, wParam, lParam)
+            except Exception:
+                return LRESULT(0)
+
+    hook_proc_ptr = HOOKPROC(_low_level_proc)
+
+    try:
+        try:
+            hmod = kernel32.GetModuleHandleW(None)
+        except Exception:
+            hmod = None
+
+        hook_handle = user32.SetWindowsHookExW(WH_KEYBOARD_LL, hook_proc_ptr, hmod or None, 0)
+        if not hook_handle:
+            err = kernel32.GetLastError()
+            logger.debug("capture_hotkey: SetWindowsHookExW failed (err=%d) hmod=%r", err, hmod)
+            hook_handle = user32.SetWindowsHookExW(WH_KEYBOARD_LL, hook_proc_ptr, None, 0)
+            if not hook_handle:
+                err2 = kernel32.GetLastError()
+                logger.error("capture_hotkey: SetWindowsHookExW final failed (err=%d)", err2)
+                return None
+
+        logger.debug("capture_hotkey: SetWindowsHookExW succeeded (hook=%r)", hook_handle)
+
+        # optional small tkinter dialog (runs in this thread)
+        tk_root = None
+        try:
+            if show_dialog:
+                try:
+                    import tkinter as tk
+                    tk_root = tk.Tk()
+                    tk_root.title("KeyFlip — введите комбинацию")
+                    # small window, always on top
+                    tk_root.attributes("-topmost", True)
+                    tk_root.geometry("360x80")
+                    label = tk.Label(tk_root, text="Нажми требуемую комбинацию (ESC — отмена)", padx=8, pady=12)
+                    label.pack(fill="both", expand=True)
+                    # disable close button action to cancel capture
+                    def on_close():
+                        # set result None and stop
+                        nonlocal result
+                        result = None
+                        done_event.set()
+                    tk_root.protocol("WM_DELETE_WINDOW", on_close)
+                    # make it appear without stealing too much focus
+                    tk_root.update()
+                except Exception:
+                    tk_root = None
+        except Exception:
+            tk_root = None
+
+        t0 = time.time()
+        while True:
+            if done_event.is_set():
+                break
+            if timeout is not None and (time.time() - t0) > timeout:
+                logger.debug("capture_hotkey: timeout expired")
+                result = None
+                break
+            # process window messages so hook works
+            msg = wintypes.MSG()
+            has = user32.PeekMessageW(ctypes.byref(msg), None, 0, 0, 1)  # PM_REMOVE = 1
+            if has:
+                user32.TranslateMessage(ctypes.byref(msg))
+                user32.DispatchMessageW(ctypes.byref(msg))
+            # update tkinter window if exists
+            if tk_root is not None:
+                try:
+                    tk_root.update()
+                except Exception:
+                    # if tkinter crashed, just ignore
+                    try:
+                        tk_root.destroy()
+                    except Exception:
+                        pass
+                    tk_root = None
+            else:
+                time.sleep(0.01)
+
+    except Exception:
+        logger.exception("capture_hotkey: exception while hooking/looping")
+        result = None
+    finally:
+        try:
+            if hook_handle:
+                user32.UnhookWindowsHookEx(hook_handle)
+                logger.debug("capture_hotkey: UnhookWindowsHookEx called")
+        except Exception:
+            logger.exception("capture_hotkey: failed to unhook")
+        try:
+            if 'tk_root' in locals() and tk_root is not None:
+                try:
+                    tk_root.destroy()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        # drop reference
+        try:
+            hook_proc_ptr = None
+        except Exception:
+            pass
+    return result
+
+# wrapper to run capture in thread and update config
+def capture_hotkey_and_apply_via_thread(icon=None):
+    def _runner():
+        thread_name = threading.current_thread().name
+        logger.info("Tray: ожидаю комбинацию для выхода. Нажми требуемую комбинацию (ESC для отмены).")
+        res = capture_hotkey_via_hook_blocking(timeout=None, show_dialog=True)
+        if not res:
+            logger.info("Tray: захват комбинации отменён или не получен.")
+            return
+        mods = res.get("modifiers", [])
+        key = res.get("key", "F10")
+        ok = write_exit_hotkey(mods, key)
+        if ok:
+            post_update_exit_hotkey()
+            logger.info("Tray: установлена новая комбинация выхода: %s + %s", "+".join(mods) if mods else "(none)", key)
+        else:
+            logger.warning("Tray: не удалось записать новую комбинацию выхода")
+    t = threading.Thread(target=_runner, daemon=True, name="ExitCaptureThread")
+    t.start()
+
+# ---------------- Tray menu actions for exit hotkey ----------------
 def _set_exit_hotkey_and_apply(mods: List[str], key: str):
     ok = write_exit_hotkey(mods, key)
     if ok:
@@ -1053,6 +1224,12 @@ def menu_set_exit_ctrl_q(icon, item):
     _set_exit_hotkey_and_apply(["CTRL"], "Q")
 def menu_set_exit_ctrl_alt_x(icon, item):
     _set_exit_hotkey_and_apply(["CTRL","ALT"], "X")
+def menu_set_exit_custom_capture(icon, item):
+    # запускаем поток с диалогом и хуком
+    try:
+        capture_hotkey_and_apply_via_thread(icon)
+    except Exception:
+        logger.exception("menu_set_exit_custom_capture: исключение при запуске capture thread")
 
 def on_exit(icon=None, item=None):
     logger.info("Выход запрошен (через трей/горячую клавишу)")
@@ -1077,30 +1254,13 @@ def tray_worker():
         MenuItem(
             "Комбинация выхода",
             Menu(
-                MenuItem(
-                    "F10 (по умолчанию)",
-                    menu_set_exit_f10,
-                    checked=lambda item: (
-                            read_exit_hotkey().get("key", "") == "F10"
-                            and not read_exit_hotkey().get("modifiers")
-                    )
-                ),
-                MenuItem(
-                    "Ctrl+Q",
-                    menu_set_exit_ctrl_q,
-                    checked=lambda item: (
-                            read_exit_hotkey().get("key", "") == "Q"
-                            and "CTRL" in read_exit_hotkey().get("modifiers", [])
-                    )
-                ),
-                MenuItem(
-                    "Ctrl+Alt+X",
-                    menu_set_exit_ctrl_alt_x,
-                    checked=lambda item: (
-                            read_exit_hotkey().get("key", "") == "X"
-                            and {"CTRL", "ALT"} == set(read_exit_hotkey().get("modifiers", []))
-                    ),
-                ),
+                MenuItem("F10 (по умолчанию)", menu_set_exit_f10,
+                         checked=lambda item: (read_exit_hotkey().get("key","")=="F10" and not read_exit_hotkey().get("modifiers"))),
+                MenuItem("Ctrl+Q", menu_set_exit_ctrl_q,
+                         checked=lambda item: (read_exit_hotkey().get("key","")=="Q" and "CTRL" in read_exit_hotkey().get("modifiers", []))),
+                MenuItem("Ctrl+Alt+X", menu_set_exit_ctrl_alt_x,
+                         checked=lambda item: (read_exit_hotkey().get("key","")=="X" and {"CTRL","ALT"} == set(read_exit_hotkey().get("modifiers", [])))),
+                MenuItem("Ввести свою комбинацию...", menu_set_exit_custom_capture),
             )
         ),
     )
@@ -1120,7 +1280,7 @@ def tray_worker():
     except Exception as e:
         logger.exception("tray_worker: исключение: %s", e)
 
-# ------------ WinAPI hotkey loop ------------
+# ---------------- WinAPI hotkey loop ----------------
 def win_hotkey_loop():
     global HOTKEY_THREAD_ID
     try:
@@ -1130,9 +1290,10 @@ def win_hotkey_loop():
         HOTKEY_THREAD_ID = 0
         logger.exception("win_hotkey_loop: failed to get thread id")
 
-    # Register dynamic exit hotkey here by calling updater (so it's done in this thread)
+    # register exit hotkey (dynamic)
     update_exit_hotkey_in_thread()
 
+    # register F4
     if is_enabled():
         register_f4_in_thread()
     else:
@@ -1188,7 +1349,7 @@ def win_hotkey_loop():
         except Exception:
             pass
 
-# ------------ Main ------------
+# ---------------- Main ----------------
 def main():
     t = threading.Thread(target=tray_worker, daemon=True, name="TrayThread")
     t.start()
@@ -1197,10 +1358,12 @@ def main():
     t2 = threading.Thread(target=win_hotkey_loop, daemon=True, name="WinHotkeyThread")
     t2.start()
     logger.debug("main: WinAPI hotkey thread started")
+
     try:
         post_update_exit_hotkey()
     except Exception:
         logger.exception("main: failed to post initial update_exit_hotkey")
+
     logger.info("%s запущен. Нажми F4 чтобы преобразовать выделение", APP_NAME)
     try:
         while not exit_event.is_set():
