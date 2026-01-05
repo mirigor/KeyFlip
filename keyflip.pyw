@@ -1,6 +1,3 @@
-# keyflip.pyw
-# Полный рабочий файл KeyFlip с возможностью менять хоткей выхода через диалог
-
 import ctypes
 import json
 import logging
@@ -10,7 +7,7 @@ import threading
 import time
 import uuid
 from logging.handlers import RotatingFileHandler
-from typing import Optional, Tuple, List, Dict
+from typing import Optional
 
 # внешние библиотеки
 try:
@@ -32,13 +29,10 @@ user32 = ctypes.windll.user32
 kernel32 = ctypes.windll.kernel32
 from ctypes import wintypes
 
-# ensure ULONG_PTR available on wintypes
-try:
-    wintypes.ULONG_PTR
-except Exception:
-    wintypes.ULONG_PTR = wintypes.WPARAM
+# алиас для указателя (устраняет замечания анализаторов)
+ULONG_PTR = wintypes.WPARAM
 
-# --- Константы / пути ---
+# ---------------- Константы / пути ----------------
 APP_NAME = "KeyFlip"
 MUTEX_NAME = r"Global\KeyFlipMutex"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -47,30 +41,55 @@ ICON_ON = os.path.join(BASE_DIR, "icon_on.ico")
 ICON_OFF = os.path.join(BASE_DIR, "icon_off.ico")
 CONFIG_FILE = os.path.join(BASE_DIR, "keyflip.json")
 
-# ------------------ Config helpers for file_logging / autorun / exit_hotkey ------------------
+# ---------------- Константы клавиш / SendInput ----------------
+INPUT_KEYBOARD = 1
+KEYEVENTF_UNICODE = 0x0004
+KEYEVENTF_KEYUP = 0x0002
+
+# Общие VK (используются в разных местах — определяем глобально)
+VK_CONTROL = 0x11
+VK_MENU = 0x12
+VK_SHIFT = 0x10
+VK_DELETE = 0x2E
+VK_INSERT = 0x2D
+VK_ESCAPE = 0x1B
+
+# Для регистратора сочетаний
+WH_KEYBOARD_LL = 13
+WM_KEYDOWN = 0x0100
+WM_SYSKEYDOWN = 0x0104
+WM_KEYUP = 0x0101
+WM_SYSKEYUP = 0x0105
+
+# ---------------- Помощники работы с конфигом (JSON) ----------------
 def read_json_config() -> dict:
+    """Прочитать JSON-конфиг, вернуть словарь (или пустой)"""
     try:
         if not os.path.isfile(CONFIG_FILE):
             return {}
         with open(CONFIG_FILE, "r", encoding="utf-8") as f:
             return json.load(f) or {}
-    except Exception:
+    except Exception:  # noqa
         return {}
 
 def write_json_config(j: dict) -> bool:
+    """Атомарная запись JSON: в tmp-файл, потом replace"""
     try:
-        # atomic-ish write: write to temp and replace
         tmp = CONFIG_FILE + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(j, f, ensure_ascii=False, indent=2)
         try:
             os.replace(tmp, CONFIG_FILE)
-        except Exception:
-            # fallback
-            os.remove(CONFIG_FILE) if os.path.exists(CONFIG_FILE) else None
+        except Exception:  # noqa
+            # fallback: удалить старый и переименовать
+            if os.path.exists(CONFIG_FILE):
+                try:
+                    os.remove(CONFIG_FILE)
+                except Exception:  # noqa
+                    pass
             os.rename(tmp, CONFIG_FILE)
         return True
-    except Exception:
+    except Exception:  # noqa
         logger.exception("config: write_json_config failed")
         return False
 
@@ -78,22 +97,20 @@ def read_file_logging_flag() -> bool:
     try:
         j = read_json_config()
         return bool(j.get("file_logging", False))
-    except Exception:
+    except Exception:  # noqa
         return False
 
 def write_file_logging_flag(val: bool) -> bool:
     try:
         j = read_json_config()
-        if "enabled" not in j:
-            j["enabled"] = True
-        if "autorun" not in j:
-            j["autorun"] = False
+        j.setdefault("enabled", True)
+        j.setdefault("autorun", False)
         j["file_logging"] = bool(val)
         ok = write_json_config(j)
         if ok:
             logger.info("config: записан file_logging=%s", j["file_logging"])
         return ok
-    except Exception:
+    except Exception:  # noqa
         logger.exception("config: write_file_logging_flag failed")
         return False
 
@@ -101,30 +118,29 @@ def read_autorun_flag() -> bool:
     try:
         j = read_json_config()
         return bool(j.get("autorun", False))
-    except Exception:
+    except Exception:  # noqa
         return False
 
 def write_autorun_flag(val: bool) -> bool:
     try:
         j = read_json_config()
-        if "enabled" not in j:
-            j["enabled"] = True
-        if "file_logging" not in j:
-            j["file_logging"] = False
+        j.setdefault("enabled", True)
+        j.setdefault("file_logging", False)
         j["autorun"] = bool(val)
         ok = write_json_config(j)
         if ok:
             logger.info("config: записан autorun=%s", j["autorun"])
         return ok
-    except Exception:
+    except Exception:  # noqa
         logger.exception("config: write_autorun_flag failed")
         return False
 
-# exit_hotkey helpers
-def default_exit_hotkey() -> Dict:
+def default_exit_hotkey() -> dict:
+    """Значение по умолчанию для комбинации выхода"""
     return {"modifiers": [], "key": "F10"}
 
-def read_exit_hotkey() -> Dict:
+def read_exit_hotkey() -> dict:
+    """Прочитать exit_hotkey из конфига — вернуть {'modifiers': [...], 'key': 'F10'}"""
     try:
         j = read_json_config()
         eh = j.get("exit_hotkey")
@@ -133,20 +149,17 @@ def read_exit_hotkey() -> Dict:
         mods = eh.get("modifiers", []) or []
         key = eh.get("key", "F10") or "F10"
         return {"modifiers": list(mods), "key": str(key)}
-    except Exception:
+    except Exception:  # noqa
         return default_exit_hotkey()
 
-def write_exit_hotkey(modifiers: List[str], key: str) -> bool:
+def write_exit_hotkey(modifiers: list[str], key: str) -> bool:
+    """Нормализовать и записать exit_hotkey в конфиг"""
     try:
         j = read_json_config()
-        if "enabled" not in j:
-            j["enabled"] = True
-        if "file_logging" not in j:
-            j["file_logging"] = False
-        if "autorun" not in j:
-            j["autorun"] = False
-        # normalise modifiers to uppercase short names
-        mods = []
+        j.setdefault("enabled", True)
+        j.setdefault("file_logging", False)
+        j.setdefault("autorun", False)
+        mods: list[str] = []
         for m in modifiers or []:
             mm = (m or "").upper()
             if mm in ("CTRL", "CONTROL"):
@@ -162,17 +175,18 @@ def write_exit_hotkey(modifiers: List[str], key: str) -> bool:
         if ok:
             logger.info("config: записан exit_hotkey=%s", j["exit_hotkey"])
         return ok
-    except Exception:
+    except Exception:  # noqa
         logger.exception("config: write_exit_hotkey failed")
         return False
 
-# ---------------- startup shortcut helpers (autorun) ----------------
+# ---------------- Autorun: создание/удаление ярлыка в автозагрузке ----------------
 def _startup_shortcut_path() -> str:
     appdata = os.environ.get("APPDATA") or os.path.expanduser("~\\AppData\\Roaming")
     startup_dir = os.path.join(appdata, "Microsoft", "Windows", "Start Menu", "Programs", "Startup")
     return os.path.join(startup_dir, f"{APP_NAME}.lnk")
 
 def create_startup_shortcut() -> bool:
+    """Создать .lnk в папке автозагрузки текущего пользователя"""
     shortcut_path = _startup_shortcut_path()
     try:
         import win32com.client  # type: ignore
@@ -193,11 +207,12 @@ def create_startup_shortcut() -> bool:
         shortcut.Save()
         logger.info("startup: ярлык создан: %s", shortcut_path)
         return True
-    except Exception:
+    except Exception:  # noqa
         logger.exception("startup: не удалось создать ярлык автозагрузки")
         return False
 
 def remove_startup_shortcut() -> bool:
+    """Удалить .lnk из автозагрузки (если есть)"""
     sp = _startup_shortcut_path()
     try:
         if os.path.isfile(sp):
@@ -206,31 +221,32 @@ def remove_startup_shortcut() -> bool:
         else:
             logger.debug("startup: ярлык не найден: %s", sp)
         return True
-    except Exception:
+    except Exception:  # noqa
         logger.exception("startup: не удалось удалить ярлык: %s", sp)
         return False
 
 def apply_autorun_setting() -> None:
+    """Применить текущее значение autorun (создать/удалить ярлык)"""
     try:
         logger.warning("AUTORUN: apply_autorun_setting CALLED")
         if read_autorun_flag():
             create_startup_shortcut()
         else:
             remove_startup_shortcut()
-    except Exception:
+    except Exception:  # noqa
         logger.exception("apply_autorun_setting: ошибка при применении autorun")
 
-# ------------------ Один экземпляр (mutex) ------------------
+# ---------------- Один экземпляр (mutex) ----------------
 mutex_handle = win32event.CreateMutex(None, False, MUTEX_NAME)
 ERROR_ALREADY_EXISTS = 183
 if win32api.GetLastError() == ERROR_ALREADY_EXISTS:
     try:
         win32api.MessageBox(0, f"Программа {APP_NAME} уже запущена!", APP_NAME, 0)
-    except Exception:
+    except Exception:  # noqa
         print(f"{APP_NAME} уже запущена!")
     sys.exit(0)
 
-# ------------------ Логирование ------------------
+# ---------------- Логирование ----------------
 logger = logging.getLogger(APP_NAME)
 logger.setLevel(logging.DEBUG)
 handler = RotatingFileHandler(LOG_FILE, maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8")
@@ -238,10 +254,11 @@ fmt = logging.Formatter("%(asctime)s %(levelname)s [%(threadName)s] %(message)s"
 handler.setFormatter(fmt)
 
 class FileLoggingFilter(logging.Filter):
+    """Фильтр, который при каждой записи проверяет флаг file_logging в конфиге"""
     def filter(self, record: logging.LogRecord) -> bool:
         try:
             return read_file_logging_flag()
-        except Exception:
+        except Exception:  # noqa
             return False
 
 handler.addFilter(FileLoggingFilter())
@@ -253,9 +270,8 @@ console.setLevel(logging.INFO)
 logger.addHandler(console)
 logger.info("%s запуск — лог: %s", APP_NAME, LOG_FILE)
 
-# ---------------- Mapping tables (EN<->RU) ----------------
-EN_TO_RU: Dict[str, str] = {
-    # letters
+# ---------------- Таблицы соответствий раскладок ----------------
+EN_TO_RU: dict[str, str] = {
     'q': 'й', 'w': 'ц', 'e': 'у', 'r': 'к', 't': 'е', 'y': 'н', 'u': 'г', 'i': 'ш', 'o': 'щ', 'p': 'з',
     'a': 'ф', 's': 'ы', 'd': 'в', 'f': 'а', 'g': 'п', 'h': 'р', 'j': 'о', 'k': 'л', 'l': 'д',
     'z': 'я', 'x': 'ч', 'c': 'с', 'v': 'м', 'b': 'и', 'n': 'т', 'm': 'ь',
@@ -287,13 +303,15 @@ EN_TO_RU: Dict[str, str] = {
 for k, v in list(EN_TO_RU.items()):
     if k.isalpha():
         EN_TO_RU[k.upper()] = v.upper()
-
-# RU -> EN (обратная таблица)
-RU_TO_EN: Dict[str, str] = {v: k for k, v in EN_TO_RU.items()}
+RU_TO_EN: dict[str, str] = {v: k for k, v in EN_TO_RU.items()}
 RU_TO_EN['ё'] = '`'
 RU_TO_EN['Ё'] = '~'
 
 def transform_text_by_keyboard_layout_based_on_hkl(s: str, hkl: int) -> str:
+    """
+    Преобразовать строку в соответствии с раскладкой:
+    если LANGID == 0x0419 (русский) — RU->EN, иначе EN->RU.
+    """
     lang = hkl & 0xFFFF
     if lang == 0x0419:
         mapping = RU_TO_EN
@@ -303,7 +321,7 @@ def transform_text_by_keyboard_layout_based_on_hkl(s: str, hkl: int) -> str:
         mapping = EN_TO_RU
         reverse = RU_TO_EN
         prefer = 'EN->RU'
-    out = []
+    out: list[str] = []
     for ch in s:
         if ch in mapping:
             out.append(mapping[ch])
@@ -315,21 +333,24 @@ def transform_text_by_keyboard_layout_based_on_hkl(s: str, hkl: int) -> str:
     logger.debug("transform: used %s mapping", prefer)
     return ''.join(out)
 
-# ---------------- Active window info ----------------
-def get_active_window_info() -> Tuple[str, int, Optional[str]]:
+# ---------------- Информация об активном окне ----------------
+def get_active_window_info() -> tuple[str, int, Optional[str]]:
+    """Вернуть (title, pid, proc_name) активного окна; при ошибке вернуть заглушки"""
     try:
         hwnd = user32.GetForegroundWindow()
-    except Exception:
+    except Exception:  # noqa
         return "<unknown>", 0, None
+
     try:
         length = user32.GetWindowTextLengthW(hwnd)
         buff = ctypes.create_unicode_buffer(length + 1)
         user32.GetWindowTextW(hwnd, buff, length + 1)
         title = buff.value
-    except Exception:
+    except Exception:  # noqa
         title = "<unknown>"
+
     pid = 0
-    proc_name = None
+    proc_name: Optional[str] = None
     try:
         pid_c = ctypes.c_ulong()
         user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid_c))
@@ -338,79 +359,71 @@ def get_active_window_info() -> Tuple[str, int, Optional[str]]:
             try:
                 proc = psutil.Process(pid)
                 proc_name = proc.name()
-            except Exception:
+            except Exception:  # noqa
                 proc_name = None
-    except Exception:
+    except Exception:  # noqa
         pass
     return title, pid, proc_name
 
-# ---------------- keyboard emulation helpers ----------------
-def _key_down(vk: int):
+# ---------------- Эмуляция нажатий клавиш ----------------
+def _key_down(vk: int) -> None:
     user32.keybd_event(vk, 0, 0, 0)
 
-def _key_up(vk: int):
-    KEYEVENTF_KEYUP = 0x0002
+def _key_up(vk: int) -> None:
     user32.keybd_event(vk, 0, KEYEVENTF_KEYUP, 0)
 
-def send_ctrl_c():
-    VK_CONTROL = 0x11
+def send_ctrl_c() -> None:
     _key_down(VK_CONTROL)
     _key_down(ord('C'))
     time.sleep(0.015)
     _key_up(ord('C'))
     _key_up(VK_CONTROL)
 
-def send_ctrl_v():
-    VK_CONTROL = 0x11
+def send_ctrl_v() -> None:
     _key_down(VK_CONTROL)
     _key_down(ord('V'))
     time.sleep(0.015)
     _key_up(ord('V'))
     _key_up(VK_CONTROL)
 
-def send_delete():
-    VK_DELETE = 0x2E
+def send_delete() -> None:
     _key_down(VK_DELETE)
     time.sleep(0.01)
     _key_up(VK_DELETE)
 
-# ---------------- SendInput UNICODE ----------------
-INPUT_KEYBOARD = 1
-KEYEVENTF_UNICODE = 0x0004
-KEYEVENTF_KEYUP = 0x0002
-wintypes.ULONG_PTR = wintypes.WPARAM
-
+# ---------------- SendInput (UNICODE) ----------------
 class KEYBDINPUT(ctypes.Structure):
     _fields_ = [
         ("wVk", wintypes.WORD),
         ("wScan", wintypes.WORD),
         ("dwFlags", wintypes.DWORD),
         ("time", wintypes.DWORD),
-        ("dwExtraInfo", wintypes.ULONG_PTR)
+        ("dwExtraInfo", ULONG_PTR),
     ]
 
-class _INPUT_union(ctypes.Union):
+class InputUnion(ctypes.Union):
     _fields_ = [("ki", KEYBDINPUT), ("padding", wintypes.ULONG * 8)]
 
 class INPUT(ctypes.Structure):
     _anonymous_ = ("union",)
-    _fields_ = [("type", wintypes.DWORD), ("union", _INPUT_union)]
+    _fields_ = [("type", wintypes.DWORD), ("union", InputUnion)]
 
 SendInput = user32.SendInput
 SendInput.argtypes = (wintypes.UINT, ctypes.POINTER(INPUT), ctypes.c_int)
 SendInput.restype = wintypes.UINT
 
-def send_unicode_via_sendinput(text: str, delay_between_keys: float = 0.001):
+def send_unicode_via_sendinput(text: str, delay_between_keys: float = 0.001) -> None:
+    """Вставить текст через SendInput (UNICODE) — не трогаем буфер обмена"""
     if not text:
         return
-    inputs = []
+    inputs: list[INPUT] = []
     for ch in text:
         code = ord(ch)
         ki_down = KEYBDINPUT(0, code, KEYEVENTF_UNICODE, 0, 0)
-        inp_down = INPUT(INPUT_KEYBOARD, _INPUT_union(ki=ki_down))
+        inp_down = INPUT(INPUT_KEYBOARD, InputUnion(ki=ki_down))
         inputs.append(inp_down)
         ki_up = KEYBDINPUT(0, code, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP, 0, 0)
-        inp_up = INPUT(INPUT_KEYBOARD, _INPUT_union(ki=ki_up))
+        inp_up = INPUT(INPUT_KEYBOARD, InputUnion(ki=ki_up))
         inputs.append(inp_up)
     n = len(inputs)
     arr_type = INPUT * n
@@ -422,27 +435,35 @@ def send_unicode_via_sendinput(text: str, delay_between_keys: float = 0.001):
     if delay_between_keys > 0:
         time.sleep(delay_between_keys)
 
-# ---------------- Clipboard helpers (safe copy) ----------------
+# ---------------- Clipboard helper (бережно) ----------------
 def safe_copy_from_selection(timeout_per_attempt: float = 0.6, max_attempts: int = 2) -> str:
+    """
+    Осторожно скопировать выделение (попытки Ctrl+C, Ctrl+Insert).
+    Возвращает строку (или пустую строку при отсутствии выделения).
+    """
     title, pid, proc_name = get_active_window_info()
     logger.debug("safe_copy: start. active window: %r pid=%s proc=%r", title, pid, proc_name)
     try:
         initial_hwnd = user32.GetForegroundWindow()
-    except Exception as e:
+    except Exception as e:  # noqa
         logger.debug("safe_copy: GetForegroundWindow failed: %s", e)
         initial_hwnd = None
+
     def foreground_changed() -> bool:
         try:
-            cur = user32.GetForegroundWindow()
-            return initial_hwnd is not None and cur is not None and cur != initial_hwnd
-        except Exception:
+            cur_hwnd = user32.GetForegroundWindow()
+            return initial_hwnd is not None and cur_hwnd is not None and cur_hwnd != initial_hwnd
+        except Exception:  # noqa
             return False
+
     try:
         old_seq = user32.GetClipboardSequenceNumber()
-    except Exception as e:
+    except Exception as e:  # noqa
         logger.debug("safe_copy: GetClipboardSequenceNumber failed: %s", e)
         old_seq = None
+
     last_exception = None
+
     if old_seq is not None:
         for attempt in range(1, max_attempts + 1):
             if foreground_changed():
@@ -451,7 +472,7 @@ def safe_copy_from_selection(timeout_per_attempt: float = 0.6, max_attempts: int
             try:
                 send_ctrl_c()
                 logger.debug("safe_copy: sent ctrl+c (attempt %d)", attempt)
-            except Exception as e:
+            except Exception as e:  # noqa
                 logger.exception("safe_copy: ctrl+c exception: %s", e)
             t0 = time.time()
             changed = False
@@ -461,7 +482,7 @@ def safe_copy_from_selection(timeout_per_attempt: float = 0.6, max_attempts: int
                     return ""
                 try:
                     seq = user32.GetClipboardSequenceNumber()
-                except Exception:
+                except Exception:  # noqa
                     seq = None
                 if seq is not None and seq != old_seq:
                     changed = True
@@ -469,28 +490,26 @@ def safe_copy_from_selection(timeout_per_attempt: float = 0.6, max_attempts: int
                 time.sleep(0.02)
             if changed:
                 try:
-                    cur = pyperclip.paste()
-                    if cur == "":
+                    pasted = pyperclip.paste()
+                    if pasted == "":
                         logger.debug("safe_copy: clipboard changed but empty -> treat as no selection")
                         return ""
-                    logger.debug("safe_copy: buffer changed after ctrl+c (len=%d)", len(cur))
-                    return cur
-                except Exception as e:
+                    logger.debug("safe_copy: buffer changed after ctrl+c (len=%d)", len(pasted))
+                    return pasted
+                except Exception as e:  # noqa
                     logger.exception("safe_copy: paste() after ctrl+c failed: %s", e)
             # fallback Ctrl+Insert
             if foreground_changed():
                 logger.debug("safe_copy: foreground changed before Ctrl+Insert -> abort")
                 return ""
             try:
-                VK_CONTROL = 0x11
-                VK_INSERT = 0x2D
                 _key_down(VK_CONTROL)
                 _key_down(VK_INSERT)
                 time.sleep(0.01)
                 _key_up(VK_INSERT)
                 _key_up(VK_CONTROL)
                 logger.debug("safe_copy: sent ctrl+insert (attempt %d)", attempt)
-            except Exception as e:
+            except Exception as e:  # noqa
                 logger.exception("safe_copy: ctrl+insert exception: %s", e)
             t0 = time.time()
             changed = False
@@ -500,7 +519,7 @@ def safe_copy_from_selection(timeout_per_attempt: float = 0.6, max_attempts: int
                     return ""
                 try:
                     seq = user32.GetClipboardSequenceNumber()
-                except Exception:
+                except Exception:  # noqa
                     seq = None
                 if seq is not None and seq != old_seq:
                     changed = True
@@ -508,18 +527,20 @@ def safe_copy_from_selection(timeout_per_attempt: float = 0.6, max_attempts: int
                 time.sleep(0.02)
             if changed:
                 try:
-                    cur = pyperclip.paste()
-                    if cur == "":
+                    pasted = pyperclip.paste()
+                    if pasted == "":
                         logger.debug("safe_copy: clipboard changed after insert but empty -> no selection")
                         return ""
-                    logger.debug("safe_copy: buffer changed after ctrl+insert (len=%d)", len(cur))
-                    return cur
-                except Exception as e:
+                    logger.debug("safe_copy: buffer changed after ctrl+insert (len=%d)", len(pasted))
+                    return pasted
+                except Exception as e:  # noqa
                     logger.exception("safe_copy: paste() after ctrl+insert failed: %s", e)
             logger.debug("safe_copy: no clipboard change after attempt %d", attempt)
             break
+
         logger.debug("safe_copy: sequence not changed -> no selection")
         return ""
+
     # ---- fallback sentinel approach ----
     if foreground_changed():
         logger.debug("safe_copy: foreground changed before fallback -> abort")
@@ -528,7 +549,7 @@ def safe_copy_from_selection(timeout_per_attempt: float = 0.6, max_attempts: int
     try:
         pyperclip.copy(sentinel)
         logger.debug("safe_copy: sentinel written for fallback")
-    except Exception as e:
+    except Exception as e:  # noqa
         logger.exception("safe_copy: cannot write sentinel: %s", e)
         return ""
     try:
@@ -537,7 +558,7 @@ def safe_copy_from_selection(timeout_per_attempt: float = 0.6, max_attempts: int
             return ""
         send_ctrl_c()
         logger.debug("safe_copy: sent ctrl+c (fallback)")
-    except Exception as e:
+    except Exception as e:  # noqa
         logger.exception("safe_copy: ctrl+c exception (fallback): %s", e)
         last_exception = e
     t0 = time.time()
@@ -546,33 +567,31 @@ def safe_copy_from_selection(timeout_per_attempt: float = 0.6, max_attempts: int
             logger.debug("safe_copy: foreground changed during fallback wait -> abort")
             return ""
         try:
-            cur = pyperclip.paste()
-        except Exception as e:
+            pasted = pyperclip.paste()
+        except Exception as e:  # noqa
             logger.debug("safe_copy: paste exception while waiting (fallback): %s", e)
-            cur = None
-        if cur is None:
+            pasted = None
+        if pasted is None:
             time.sleep(0.02)
             continue
-        if cur != sentinel:
-            if cur == "":
+        if pasted != sentinel:
+            if pasted == "":
                 return ""
-            logger.debug("safe_copy: buffer changed (fallback) len=%d", len(cur))
-            return cur
+            logger.debug("safe_copy: buffer changed (fallback) len=%d", len(pasted))
+            return pasted
         time.sleep(0.02)
-    # last attempt Ctrl+Insert
+    # last attempt: Ctrl+Insert
     if foreground_changed():
         logger.debug("safe_copy: foreground changed before fallback Ctrl+Insert -> abort")
         return ""
     try:
-        VK_CONTROL = 0x11
-        VK_INSERT = 0x2D
         _key_down(VK_CONTROL)
         _key_down(VK_INSERT)
         time.sleep(0.01)
         _key_up(VK_INSERT)
         _key_up(VK_CONTROL)
         logger.debug("safe_copy: sent ctrl+insert (fallback last)")
-    except Exception as e:
+    except Exception as e:  # noqa
         logger.exception("safe_copy: ctrl+insert exception (fallback last): %s", e)
         last_exception = e
     t0 = time.time()
@@ -581,18 +600,18 @@ def safe_copy_from_selection(timeout_per_attempt: float = 0.6, max_attempts: int
             logger.debug("safe_copy: foreground changed during fallback insert wait -> abort")
             return ""
         try:
-            cur = pyperclip.paste()
-        except Exception as e:
+            pasted = pyperclip.paste()
+        except Exception as e:  # noqa
             logger.debug("safe_copy: paste exception after insert (fallback): %s", e)
-            cur = None
-        if cur is None:
+            pasted = None
+        if pasted is None:
             time.sleep(0.02)
             continue
-        if cur != sentinel:
-            if cur == "":
+        if pasted != sentinel:
+            if pasted == "":
                 return ""
-            logger.debug("safe_copy: buffer changed after ctrl+insert (fallback) len=%d", len(cur))
-            return cur
+            logger.debug("safe_copy: buffer changed after ctrl+insert (fallback) len=%d", len(pasted))
+            return pasted
         time.sleep(0.02)
     logger.warning("safe_copy: НЕ удалось получить выделение. last_exc=%r", repr(last_exception))
     return ""
@@ -601,7 +620,8 @@ def safe_copy_from_selection(timeout_per_attempt: float = 0.6, max_attempts: int
 _enabled_lock = threading.Lock()
 _enabled: bool = True
 
-def load_config():
+def load_config() -> None:
+    """Загрузить конфиг, установить дефолты при их отсутствии"""
     global _enabled
     changed = False
     j = read_json_config()
@@ -624,41 +644,40 @@ def load_config():
     if changed:
         write_json_config(j)
 
-def save_config():
+def save_config() -> None:
+    """Сохранить минимальную информацию (enabled)"""
     try:
         with _enabled_lock:
             j = {"enabled": bool(_enabled)}
         with open(CONFIG_FILE, "w", encoding="utf-8") as f:
             json.dump(j, f)
         logger.debug("config: saved enabled=%s to %s", j["enabled"], CONFIG_FILE)
-    except Exception:
+    except Exception:  # noqa
         logger.exception("config: save failed")
 
 def is_enabled() -> bool:
     with _enabled_lock:
         return bool(_enabled)
 
-def set_enabled(val: bool):
+def set_enabled(val: bool) -> None:
     global _enabled
     with _enabled_lock:
         _enabled = bool(val)
     save_config()
     logger.info("state: enabled set to %s", _enabled)
 
-# initial load
+# загрузка конфига и применение autorun при старте
 load_config()
-# apply autorun if needed
 try:
     apply_autorun_setting()
-except Exception:
+except Exception:  # noqa
     logger.exception("startup: apply_autorun_setting on startup failed")
 
-# ---------------- Hotkey constants & messaging ----------------
+# ---------------- Hotkey: регистрация и обмен сообщениями ----------------
 HOTKEY_ID_F4 = 1
 HOTKEY_ID_EXIT = 2
 MOD_NONE = 0
 
-# We'll use PostThreadMessage to request registration/unregistration in the hotkey thread
 WM_USER = 0x0400
 MSG_REGISTER_F4 = WM_USER + 1
 MSG_UNREGISTER_F4 = WM_USER + 2
@@ -666,7 +685,8 @@ MSG_UPDATE_EXIT_HOTKEY = WM_USER + 3
 
 HOTKEY_THREAD_ID = 0
 
-def post_register_f4(should_register: bool):
+def post_register_f4(should_register: bool) -> bool:
+    """Послать потоковое сообщение для регистрации/отмены F4"""
     global HOTKEY_THREAD_ID
     if HOTKEY_THREAD_ID == 0:
         logger.warning("post_register_f4: HOTKEY_THREAD_ID not ready yet -> cannot post")
@@ -681,11 +701,12 @@ def post_register_f4(should_register: bool):
             return False
         logger.debug("post_register_f4: posted msg=%d wParam=%d to thread %d", msg, wparam, HOTKEY_THREAD_ID)
         return True
-    except Exception:
+    except Exception:  # noqa
         logger.exception("post_register_f4: exception while posting")
         return False
 
-def post_update_exit_hotkey():
+def post_update_exit_hotkey() -> bool:
+    """Попросить hotkey-поток перерегистрировать комбинацию выхода (читает из файла)"""
     global HOTKEY_THREAD_ID
     if HOTKEY_THREAD_ID == 0:
         logger.warning("post_update_exit_hotkey: HOTKEY_THREAD_ID not ready yet -> cannot post")
@@ -698,12 +719,12 @@ def post_update_exit_hotkey():
             return False
         logger.debug("post_update_exit_hotkey: posted MSG_UPDATE_EXIT_HOTKEY to thread %d", HOTKEY_THREAD_ID)
         return True
-    except Exception:
+    except Exception:  # noqa
         logger.exception("post_update_exit_hotkey: exception while posting")
         return False
 
-# ---------------- Hotkey register helpers ----------------
-def register_f4_in_thread():
+# ---------------- Register / Unregister F4 ----------------
+def register_f4_in_thread() -> None:
     try:
         ok = user32.RegisterHotKey(None, HOTKEY_ID_F4, MOD_NONE, 0x73)  # F4 VK = 0x73
         if ok:
@@ -711,21 +732,20 @@ def register_f4_in_thread():
         else:
             err = kernel32.GetLastError()
             logger.error("register_f4: failed to register F4 (err=%d)", err)
-    except Exception:
+    except Exception:  # noqa
         logger.exception("register_f4: exception while registering F4")
 
-def unregister_f4_in_thread():
+def unregister_f4_in_thread() -> None:
     try:
         ok = user32.UnregisterHotKey(None, HOTKEY_ID_F4)
         if ok:
             logger.debug("unregister_f4: F4 unregistered in hotkey thread")
         else:
             logger.debug("unregister_f4: UnregisterHotKey returned False (probably not registered)")
-    except Exception:
+    except Exception:  # noqa
         logger.exception("unregister_f4: exception while unregistering F4")
 
-# ------------- Exit hotkey (dynamic registration) ----------------
-# Modifiers masks for RegisterHotKey
+# ---------------- Exit hotkey: динамическая регистрация ----------------
 MOD_ALT = 0x0001
 MOD_CONTROL = 0x0002
 MOD_SHIFT = 0x0004
@@ -740,9 +760,10 @@ VK_MAP = {
 }
 
 def key_name_to_vk(name: str) -> int:
+    """Преобразовать читаемое имя клавиши в VK-код"""
     n = (name or "").upper()
     if not n:
-        return 0x79
+        return VK_MAP.get("F10", 0x79)
     if n in VK_MAP:
         return VK_MAP[n]
     if len(n) == 1:
@@ -754,11 +775,12 @@ def key_name_to_vk(name: str) -> int:
     try:
         if n.startswith("VK_"):
             return int(getattr(win32con, n, 0))
-    except Exception:
+    except Exception:  # noqa
         pass
-    return 0x79
+    return VK_MAP.get("F10", 0x79)
 
-def modifiers_list_to_mask(mods: List[str]) -> int:
+def modifiers_list_to_mask(mods: list[str]) -> int:
+    """Преобразовать список модификаторов в маску для RegisterHotKey"""
     mask = 0
     for m in mods:
         mm = (m or "").upper()
@@ -772,11 +794,12 @@ def modifiers_list_to_mask(mods: List[str]) -> int:
             mask |= MOD_WIN
     return mask
 
-def update_exit_hotkey_in_thread():
+def update_exit_hotkey_in_thread() -> None:
+    """В hotkey-потоке: снять старую комбинацию выхода и зарегистрировать новую"""
     try:
         try:
             user32.UnregisterHotKey(None, HOTKEY_ID_EXIT)
-        except Exception:
+        except Exception:  # noqa
             pass
         eh = read_exit_hotkey()
         mods = eh.get("modifiers", []) or []
@@ -791,16 +814,17 @@ def update_exit_hotkey_in_thread():
             err = kernel32.GetLastError()
             logger.error("update_exit_hotkey_in_thread: failed to register exit hotkey (err=%d) mask=0x%X vk=0x%X",
                          err, mask, vk)
-    except Exception:
+    except Exception:  # noqa
         logger.exception("update_exit_hotkey_in_thread: exception")
 
-# ------------------ Handler & transform logic ------------------
+# ---------------- Обработчик F4 и основная логика преобразования ----------------
 exit_event = threading.Event()
 _handler_lock = threading.Lock()
 _last_f4_ts = 0.0
 _F4_DEBOUNCE_SEC = 0.6
 
-def _f4_invoker():
+def _f4_invoker() -> None:
+    """Дебаунс и запуск worker-потока для обработки F4"""
     global _last_f4_ts
     if not is_enabled():
         logger.debug("F4: ignored because enabled==False")
@@ -813,17 +837,18 @@ def _f4_invoker():
     if not _handler_lock.acquire(blocking=False):
         logger.debug("F4: handler busy, ignored")
         return
-    def _worker():
+    def _worker() -> None:
         try:
             handle_hotkey_transform()
         finally:
             try:
                 _handler_lock.release()
-            except Exception:
+            except Exception:  # noqa
                 pass
     threading.Thread(target=_worker, daemon=True).start()
 
-def handle_hotkey_transform():
+def handle_hotkey_transform() -> None:
+    """Главная логика F4: прочитать выделение, преобразовать раскладку и вставить обратно"""
     logger.info("F4 обработка — начинаю преобразование выделения")
     try:
         if not is_enabled():
@@ -832,23 +857,25 @@ def handle_hotkey_transform():
         title, pid, proc_name = get_active_window_info()
         logger.info("handle: active window: %r pid=%s proc=%r", title, pid, proc_name)
         try:
-            saved = None
             try:
                 saved = pyperclip.paste()
-            except Exception:
+            except Exception:  # noqa
                 saved = None
             logger.debug("handle: прочитал (но не буду восстанавливать) буфер text-len=%s", None if saved is None else len(saved))
-        except Exception:
-            saved = None
+        except Exception:  # noqa
+            pass
+
+        hwnd = None
         try:
             hwnd = user32.GetForegroundWindow()
             pid_c = ctypes.c_ulong()
             thread_id = user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid_c))
             hkl = user32.GetKeyboardLayout(thread_id) & 0xFFFF
             logger.debug("handle: foreground thread hkl=0x%04X", hkl)
-        except Exception:
+        except Exception:  # noqa
             hkl = 0
             logger.exception("handle: не удалось получить HKL, предполагаем EN")
+
         selected = safe_copy_from_selection(timeout_per_attempt=0.6, max_attempts=2)
         if selected is None:
             selected = ""
@@ -856,29 +883,33 @@ def handle_hotkey_transform():
         if not selected:
             logger.info("handle: выделение пустое — ничего не делаю.")
             return
+
         converted = transform_text_by_keyboard_layout_based_on_hkl(selected, hkl)
         logger.info("handle: преобразование выполнено (len=%d).", len(converted))
         logger.debug("handle: исходное=%r converted=%r", selected, converted)
         if converted == selected:
             logger.info("handle: преобразованный текст совпадает с исходным — ничего не меняю.")
             return
+
         try:
             send_delete()
             time.sleep(0.02)
-        except Exception as e:
+        except Exception as e:  # noqa
             logger.exception("handle: delete exception: %s", e)
+
         try:
             send_unicode_via_sendinput(converted, delay_between_keys=0.001)
             logger.debug("handle: вставил через SendInput (unicode) — без использования clipboard")
-        except Exception as e:
+        except Exception as e:  # noqa
             logger.exception("handle: send_unicode_via_sendinput failed: %s", e)
             try:
                 pyperclip.copy(converted)
                 time.sleep(0.02)
                 send_ctrl_v()
                 logger.debug("handle: fallback: вставил через буфер (ctrl+v)")
-            except Exception as e2:
+            except Exception as e2:  # noqa
                 logger.exception("handle: fallback paste failed: %s", e2)
+
         try:
             if hwnd:
                 if hkl == 0x0419:
@@ -893,18 +924,20 @@ def handle_hotkey_transform():
                     try:
                         user32.ActivateKeyboardLayout(hkl_new, 0)
                         logger.debug("handle: ActivateKeyboardLayout used as fallback")
-                    except Exception:
+                    except Exception:  # noqa
                         logger.exception("handle: fallback ActivateKeyboardLayout also failed")
                 else:
                     logger.debug("handle: posted WM_INPUTLANGCHANGEREQUEST -> success")
-        except Exception:
+        except Exception:  # noqa
             logger.exception("handle: switch layout failed (foreground-thread)")
+
         logger.info("handle: завершено успешно. (буфер оставлен как есть — в нём будет выделение)")
-    except Exception as e:
+    except Exception as e:  # noqa
         logger.exception("handle_hotkey_transform: исключение при обработке: %s", e)
 
-# ---------------- Tray / Icon ----------------
+# ---------------- Tray / Icon / Меню ----------------
 def prepare_tray_icon_image(enabled: Optional[bool] = None) -> Image.Image:
+    """Подготовить PIL.Image для иконки в трее (файлы icon_on/icon_off или fallback)"""
     if enabled is None:
         enabled = is_enabled()
     path = ICON_ON if enabled else ICON_OFF
@@ -913,7 +946,7 @@ def prepare_tray_icon_image(enabled: Optional[bool] = None) -> Image.Image:
             img = Image.open(path)
             logger.debug("Tray icon: using %s", path)
             return img
-        except Exception:
+        except Exception:  # noqa
             logger.exception("Tray icon: cannot open %s", path)
     size = (64, 64)
     bg = (76, 175, 80, 255) if enabled else (220, 53, 69, 255)
@@ -922,14 +955,16 @@ def prepare_tray_icon_image(enabled: Optional[bool] = None) -> Image.Image:
     try:
         d.rectangle((8, 16, 56, 48), outline=(255,255,255), width=2)
         d.text((16, 12), "KF", fill=(255,255,255))
-    except Exception:
+    except Exception:  # noqa
         pass
     return img
 
-def enabled_menu_text(item):
+def enabled_menu_text(_item) -> str:
+    """Текст пункта меню Вкл/Выкл в зависимости от состояния"""
     return "❌ Выключить" if is_enabled() else "✅ Включить"
 
-def toggle_enabled(icon, item):
+def toggle_enabled(_icon, _item) -> None:
+    """Переключить глобальное включение/выключение приложения (и icon)"""
     new_state = not is_enabled()
     set_enabled(new_state)
     logger.info("Tray: toggled enabled -> %s", new_state)
@@ -937,15 +972,18 @@ def toggle_enabled(icon, item):
         ok = post_register_f4(new_state)
         if not ok:
             logger.warning("toggle_enabled: post_register_f4 returned False")
-    except Exception:
+    except Exception:  # noqa
         logger.exception("toggle_enabled: failed to post register/unregister request")
+    # обновление иконки (если вызов пришёл из pystray)
     try:
-        if icon is not None:
-            icon.icon = prepare_tray_icon_image(new_state)
-    except Exception:
+        # pystray передаёт Icon первым аргументом в callback, но может быть None
+        if _icon is not None:
+            _icon.icon = prepare_tray_icon_image(new_state)
+    except Exception:  # noqa
         logger.exception("Tray: failed to update icon image after toggle")
 
-def toggle_file_logging(icon, item):
+def toggle_file_logging(_icon, _item) -> None:
+    """Переключить логирование в файл (чтение/запись в конфиг)"""
     try:
         current = read_file_logging_flag()
         new = not current
@@ -954,10 +992,11 @@ def toggle_file_logging(icon, item):
             logger.info("Tray: file_logging toggled -> %s", new)
         else:
             logger.warning("Tray: file_logging toggle attempted but write failed")
-    except Exception:
+    except Exception:  # noqa
         logger.exception("toggle_file_logging: exception")
 
-def toggle_autorun(icon, item):
+def toggle_autorun(_icon, _item) -> None:
+    """Переключить автозапуск (создать/удалить ярлык и записать в конфиг)"""
     try:
         current = read_autorun_flag()
         new = not current
@@ -967,25 +1006,11 @@ def toggle_autorun(icon, item):
             apply_autorun_setting()
         else:
             logger.warning("Tray: autorun toggle attempted but write failed")
-    except Exception:
+    except Exception:  # noqa
         logger.exception("toggle_autorun: exception")
 
-# ---------------- Hotkey capture (dialog + hook) ----------------
-# We provide a blocking capture function (but we'll run it in a separate thread).
-# It shows a small tkinter dialog telling user to press the desired combo.
-# The hook listens to low-level keyboard events and records the first non-modifier key + active modifiers.
-
-# low-level hook constants
-WH_KEYBOARD_LL = 13
-WM_KEYDOWN = 0x0100
-WM_SYSKEYDOWN = 0x0104
-WM_KEYUP = 0x0101
-WM_SYSKEYUP = 0x0105
-VK_ESCAPE = 0x1B
-
-VK_CONTROL = 0x11
-VK_MENU = 0x12
-VK_SHIFT = 0x10
+# ---------------- Hotkey захват: диалог + low-level hook ----------------
+# Вспомогательные VK для low-level hook
 VK_LSHIFT = 0xA0
 VK_RSHIFT = 0xA1
 VK_LCONTROL = 0xA2
@@ -995,22 +1020,20 @@ VK_RMENU = 0xA5
 VK_LWIN = 0x5B
 VK_RWIN = 0x5C
 
-# LRESULT type depending on architecture
-if ctypes.sizeof(ctypes.c_void_p) == 8:
-    LRESULT = ctypes.c_longlong
-else:
-    LRESULT = ctypes.c_long
+# LRESULT тип в зависимости от разрядности
+LRESULT = ctypes.c_longlong if ctypes.sizeof(ctypes.c_void_p) == 8 else ctypes.c_long
 
 class KBDLLHOOKSTRUCT(ctypes.Structure):
+    """Структура параметров, передаваемых low-level hook'ом клавиатуры"""
     _fields_ = [
         ("vkCode", wintypes.DWORD),
         ("scanCode", wintypes.DWORD),
         ("flags", wintypes.DWORD),
         ("time", wintypes.DWORD),
-        ("dwExtraInfo", wintypes.ULONG_PTR),
+        ("dwExtraInfo", ULONG_PTR),
     ]
 
-# Set argtypes/restype for CallNextHookEx
+# корректные argtypes/restype для функций хука
 user32.SetWindowsHookExW.argtypes = (wintypes.INT, ctypes.c_void_p, wintypes.HINSTANCE, wintypes.DWORD)
 user32.SetWindowsHookExW.restype = wintypes.HHOOK
 user32.UnhookWindowsHookEx.argtypes = (wintypes.HHOOK,)
@@ -1019,14 +1042,16 @@ user32.CallNextHookEx.argtypes = (wintypes.HHOOK, ctypes.c_int, wintypes.WPARAM,
 user32.CallNextHookEx.restype = LRESULT
 
 def _vk_is_modifier(vk: int) -> bool:
+    """Является ли VK модификатором (Ctrl/Alt/Shift/Win)"""
     return vk in (
         VK_CONTROL, VK_MENU, VK_SHIFT,
         VK_LSHIFT, VK_RSHIFT, VK_LCONTROL, VK_RCONTROL, VK_LMENU, VK_RMENU,
         VK_LWIN, VK_RWIN
     )
 
-def _current_modifiers_list() -> list:
-    mods = []
+def _current_modifiers_list() -> list[str]:
+    """Вернуть список удерживаемых модификаторов в момент вызова"""
+    mods: list[str] = []
     try:
         if user32.GetAsyncKeyState(VK_LCONTROL) & 0x8000 or user32.GetAsyncKeyState(VK_RCONTROL) & 0x8000:
             mods.append("CTRL")
@@ -1036,18 +1061,15 @@ def _current_modifiers_list() -> list:
             mods.append("SHIFT")
         if user32.GetAsyncKeyState(VK_LWIN) & 0x8000 or user32.GetAsyncKeyState(VK_RWIN) & 0x8000:
             mods.append("WIN")
-    except Exception:
+    except Exception:  # noqa
         pass
     return mods
 
 def vk_to_key_name(vk: int) -> str:
-    n = None
+    """Преобразовать VK в удобочитаемое имя клавиши (F1..F12, A..Z, 0..9, SPACE, ENTER и т.д.)"""
     for name, code in VK_MAP.items():
         if code == vk:
-            n = name
-            break
-    if n:
-        return n
+            return name
     if 0x41 <= vk <= 0x5A:
         return chr(vk)
     if 0x30 <= vk <= 0x39:
@@ -1059,7 +1081,13 @@ def vk_to_key_name(vk: int) -> str:
     return f"VK_{vk:02X}"
 
 def capture_hotkey_via_hook_blocking(timeout: Optional[float] = 10.0, show_dialog: bool = True) -> Optional[dict]:
-    result = {"modifiers": [], "key": ""}
+    """
+    Заблокированно захватить комбинацию клавиш:
+    — показать всплывающее окно (tkinter),
+    — слушать WH_KEYBOARD_LL, записать первую ненулевую (не-модификаторную) клавишу с текущими модификаторами.
+    Возвращает {'modifiers': [...], 'key': 'X'} или None при отмене/таймауте/ошибке.
+    """
+    result: Optional[dict] = {"modifiers": [], "key": ""}
     done_event = threading.Event()
     hook_handle = None
 
@@ -1076,7 +1104,7 @@ def capture_hotkey_via_hook_blocking(timeout: Optional[float] = 10.0, show_dialo
                     done_event.set()
                     return user32.CallNextHookEx(hook_handle, nCode, wParam, lParam)
                 if _vk_is_modifier(vk):
-                    # ignore pure modifier press
+                    # игнорируем одиночный модификатор
                     return user32.CallNextHookEx(hook_handle, nCode, wParam, lParam)
                 mods = _current_modifiers_list()
                 keyname = vk_to_key_name(vk)
@@ -1084,11 +1112,11 @@ def capture_hotkey_via_hook_blocking(timeout: Optional[float] = 10.0, show_dialo
                 done_event.set()
                 return user32.CallNextHookEx(hook_handle, nCode, wParam, lParam)
             return user32.CallNextHookEx(hook_handle, nCode, wParam, lParam)
-        except Exception:
+        except Exception:  # noqa
             logger.exception("capture_hotkey: hook proc exception")
             try:
                 return user32.CallNextHookEx(hook_handle, nCode, wParam, lParam)
-            except Exception:
+            except Exception:  # noqa
                 return LRESULT(0)
 
     hook_proc_ptr = HOOKPROC(_low_level_proc)
@@ -1096,7 +1124,7 @@ def capture_hotkey_via_hook_blocking(timeout: Optional[float] = 10.0, show_dialo
     try:
         try:
             hmod = kernel32.GetModuleHandleW(None)
-        except Exception:
+        except Exception:  # noqa
             hmod = None
 
         hook_handle = user32.SetWindowsHookExW(WH_KEYBOARD_LL, hook_proc_ptr, hmod or None, 0)
@@ -1111,7 +1139,6 @@ def capture_hotkey_via_hook_blocking(timeout: Optional[float] = 10.0, show_dialo
 
         logger.debug("capture_hotkey: SetWindowsHookExW succeeded (hook=%r)", hook_handle)
 
-        # optional small tkinter dialog (runs in this thread)
         tk_root = None
         try:
             if show_dialog:
@@ -1119,23 +1146,19 @@ def capture_hotkey_via_hook_blocking(timeout: Optional[float] = 10.0, show_dialo
                     import tkinter as tk
                     tk_root = tk.Tk()
                     tk_root.title("KeyFlip — введите комбинацию")
-                    # small window, always on top
                     tk_root.attributes("-topmost", True)
                     tk_root.geometry("360x80")
                     label = tk.Label(tk_root, text="Нажми требуемую комбинацию (ESC — отмена)", padx=8, pady=12)
                     label.pack(fill="both", expand=True)
-                    # disable close button action to cancel capture
                     def on_close():
-                        # set result None and stop
                         nonlocal result
                         result = None
                         done_event.set()
                     tk_root.protocol("WM_DELETE_WINDOW", on_close)
-                    # make it appear without stealing too much focus
                     tk_root.update()
-                except Exception:
+                except Exception:  # noqa
                     tk_root = None
-        except Exception:
+        except Exception:  # noqa
             tk_root = None
 
         t0 = time.time()
@@ -1146,27 +1169,26 @@ def capture_hotkey_via_hook_blocking(timeout: Optional[float] = 10.0, show_dialo
                 logger.debug("capture_hotkey: timeout expired")
                 result = None
                 break
-            # process window messages so hook works
+            # процесс сообщений, чтобы хук работал
             msg = wintypes.MSG()
             has = user32.PeekMessageW(ctypes.byref(msg), None, 0, 0, 1)  # PM_REMOVE = 1
             if has:
                 user32.TranslateMessage(ctypes.byref(msg))
                 user32.DispatchMessageW(ctypes.byref(msg))
-            # update tkinter window if exists
+            # обновление tkinter окна
             if tk_root is not None:
                 try:
                     tk_root.update()
-                except Exception:
-                    # if tkinter crashed, just ignore
+                except Exception:  # noqa
                     try:
                         tk_root.destroy()
-                    except Exception:
+                    except Exception:  # noqa
                         pass
                     tk_root = None
             else:
                 time.sleep(0.01)
 
-    except Exception:
+    except Exception:  # noqa
         logger.exception("capture_hotkey: exception while hooking/looping")
         result = None
     finally:
@@ -1174,27 +1196,26 @@ def capture_hotkey_via_hook_blocking(timeout: Optional[float] = 10.0, show_dialo
             if hook_handle:
                 user32.UnhookWindowsHookEx(hook_handle)
                 logger.debug("capture_hotkey: UnhookWindowsHookEx called")
-        except Exception:
+        except Exception:  # noqa
             logger.exception("capture_hotkey: failed to unhook")
         try:
             if 'tk_root' in locals() and tk_root is not None:
                 try:
                     tk_root.destroy()
-                except Exception:
+                except Exception:  # noqa
                     pass
-        except Exception:
+        except Exception:  # noqa
             pass
-        # drop reference
+        # избавиться от ссылки на callback
         try:
             hook_proc_ptr = None
-        except Exception:
+        except Exception:  # noqa
             pass
     return result
 
-# wrapper to run capture in thread and update config
-def capture_hotkey_and_apply_via_thread(icon=None):
-    def _runner():
-        thread_name = threading.current_thread().name
+def capture_hotkey_and_apply_via_thread(_icon=None) -> None:
+    """Запустить поток, который покажет окно и захватит комбинацию, затем запишет её в конфиг"""
+    def _runner() -> None:
         logger.info("Tray: ожидаю комбинацию для выхода. Нажми требуемую комбинацию (ESC для отмены).")
         res = capture_hotkey_via_hook_blocking(timeout=None, show_dialog=True)
         if not res:
@@ -1211,42 +1232,46 @@ def capture_hotkey_and_apply_via_thread(icon=None):
     t = threading.Thread(target=_runner, daemon=True, name="ExitCaptureThread")
     t.start()
 
-# ---------------- Tray menu actions for exit hotkey ----------------
-def _set_exit_hotkey_and_apply(mods: List[str], key: str):
+# ---------------- Меню: предустановленные комбинации и кастомный ввод ----------------
+def _set_exit_hotkey_and_apply(mods: list[str], key: str) -> bool:
     ok = write_exit_hotkey(mods, key)
     if ok:
         post_update_exit_hotkey()
     return ok
 
-def menu_set_exit_f10(icon, item):
+def menu_set_exit_f10(_icon, _item) -> None:
     _set_exit_hotkey_and_apply([], "F10")
-def menu_set_exit_ctrl_q(icon, item):
+
+def menu_set_exit_ctrl_q(_icon, _item) -> None:
     _set_exit_hotkey_and_apply(["CTRL"], "Q")
-def menu_set_exit_ctrl_alt_x(icon, item):
-    _set_exit_hotkey_and_apply(["CTRL","ALT"], "X")
-def menu_set_exit_custom_capture(icon, item):
-    # запускаем поток с диалогом и хуком
+
+def menu_set_exit_ctrl_alt_x(_icon, _item) -> None:
+    _set_exit_hotkey_and_apply(["CTRL", "ALT"], "X")
+
+def menu_set_exit_custom_capture(_icon, _item) -> None:
     try:
-        capture_hotkey_and_apply_via_thread(icon)
-    except Exception:
+        capture_hotkey_and_apply_via_thread(_icon)
+    except Exception:  # noqa
         logger.exception("menu_set_exit_custom_capture: исключение при запуске capture thread")
 
-def on_exit(icon=None, item=None):
+def on_exit(_icon=None, _item=None) -> None:
+    """Завершить работу приложения (через трей или хоткей выхода)"""
     logger.info("Выход запрошен (через трей/горячую клавишу)")
     exit_event.set()
     try:
-        if icon:
-            icon.stop()
-    except Exception:
+        if _icon:
+            _icon.stop()
+    except Exception:  # noqa
         logger.exception("on_exit: ошибка при остановке иконки")
     try:
         win32event.ReleaseMutex(mutex_handle)
-    except Exception:
+    except Exception:  # noqa
         pass
     logger.info("Завершение работы.")
     return
 
-def tray_worker():
+def tray_worker() -> None:
+    """Запустить pystray icon + меню (в отдельном потоке)"""
     img = prepare_tray_icon_image()
     settings_menu = Menu(
         MenuItem("Логирование в файл", toggle_file_logging, checked=lambda item: read_file_logging_flag()),
@@ -1255,11 +1280,11 @@ def tray_worker():
             "Комбинация выхода",
             Menu(
                 MenuItem("F10 (по умолчанию)", menu_set_exit_f10,
-                         checked=lambda item: (read_exit_hotkey().get("key","")=="F10" and not read_exit_hotkey().get("modifiers"))),
+                         checked=lambda item: (read_exit_hotkey().get("key", "") == "F10" and not read_exit_hotkey().get("modifiers"))),
                 MenuItem("Ctrl+Q", menu_set_exit_ctrl_q,
-                         checked=lambda item: (read_exit_hotkey().get("key","")=="Q" and "CTRL" in read_exit_hotkey().get("modifiers", []))),
+                         checked=lambda item: (read_exit_hotkey().get("key", "") == "Q" and "CTRL" in read_exit_hotkey().get("modifiers", []))),
                 MenuItem("Ctrl+Alt+X", menu_set_exit_ctrl_alt_x,
-                         checked=lambda item: (read_exit_hotkey().get("key","")=="X" and {"CTRL","ALT"} == set(read_exit_hotkey().get("modifiers", [])))),
+                         checked=lambda item: (read_exit_hotkey().get("key", "") == "X" and {"CTRL", "ALT"} == set(read_exit_hotkey().get("modifiers", [])))),
                 MenuItem("Ввести свою комбинацию...", menu_set_exit_custom_capture),
             )
         ),
@@ -1272,34 +1297,33 @@ def tray_worker():
     icon = Icon(APP_NAME, img, APP_NAME, menu=menu)
     try:
         icon.icon = prepare_tray_icon_image(is_enabled())
-    except Exception:
+    except Exception:  # noqa
         logger.exception("tray_worker: failed to set initial icon")
     try:
         logger.debug("tray_worker: запуск иконки")
         icon.run()
-    except Exception as e:
+    except Exception as e:  # noqa
         logger.exception("tray_worker: исключение: %s", e)
 
-# ---------------- WinAPI hotkey loop ----------------
-def win_hotkey_loop():
+# ---------------- WinAPI hotkey loop (главный hotkey-поток) ----------------
+def win_hotkey_loop() -> None:
+    """Поток, который слушает сообщения Windows и обрабатывает WM_HOTKEY и наши внутренние сообщения"""
     global HOTKEY_THREAD_ID
     try:
         HOTKEY_THREAD_ID = kernel32.GetCurrentThreadId()
         logger.debug("win_hotkey_loop: HOTKEY_THREAD_ID = %d", HOTKEY_THREAD_ID)
-    except Exception:
+    except Exception:  # noqa
         HOTKEY_THREAD_ID = 0
         logger.exception("win_hotkey_loop: failed to get thread id")
 
-    # register exit hotkey (dynamic)
     update_exit_hotkey_in_thread()
 
-    # register F4
     if is_enabled():
         register_f4_in_thread()
     else:
         try:
             user32.UnregisterHotKey(None, HOTKEY_ID_F4)
-        except Exception:
+        except Exception:  # noqa
             pass
 
     try:
@@ -1312,21 +1336,21 @@ def win_hotkey_loop():
                 logger.debug("win_hotkey_loop: MSG_REGISTER_F4 received wParam=%s", int(msg.wParam))
                 try:
                     register_f4_in_thread()
-                except Exception:
+                except Exception:  # noqa
                     logger.exception("win_hotkey_loop: register_f4_in_thread failed")
                 continue
             elif msg.message == MSG_UNREGISTER_F4:
                 logger.debug("win_hotkey_loop: MSG_UNREGISTER_F4 received")
                 try:
                     unregister_f4_in_thread()
-                except Exception:
+                except Exception:  # noqa
                     logger.exception("win_hotkey_loop: unregister_f4_in_thread failed")
                 continue
             elif msg.message == MSG_UPDATE_EXIT_HOTKEY:
                 logger.debug("win_hotkey_loop: MSG_UPDATE_EXIT_HOTKEY received -> update exit hotkey")
                 try:
                     update_exit_hotkey_in_thread()
-                except Exception:
+                except Exception:  # noqa
                     logger.exception("win_hotkey_loop: update_exit_hotkey_in_thread failed")
                 continue
             if msg.message == 0x0312:  # WM_HOTKEY
@@ -1346,11 +1370,11 @@ def win_hotkey_loop():
         try:
             user32.UnregisterHotKey(None, HOTKEY_ID_F4)
             user32.UnregisterHotKey(None, HOTKEY_ID_EXIT)
-        except Exception:
+        except Exception:  # noqa
             pass
 
 # ---------------- Main ----------------
-def main():
+def main() -> None:
     t = threading.Thread(target=tray_worker, daemon=True, name="TrayThread")
     t.start()
     logger.debug("main: трей поток запущен")
@@ -1361,7 +1385,7 @@ def main():
 
     try:
         post_update_exit_hotkey()
-    except Exception:
+    except Exception:  # noqa
         logger.exception("main: failed to post initial update_exit_hotkey")
 
     logger.info("%s запущен. Нажми F4 чтобы преобразовать выделение", APP_NAME)
@@ -1373,7 +1397,7 @@ def main():
     finally:
         try:
             win32event.ReleaseMutex(mutex_handle)
-        except Exception:
+        except Exception:  # noqa
             pass
         logger.info("main: завершение")
 
