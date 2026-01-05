@@ -1,5 +1,3 @@
-# keyflip_winapi.py
-from __future__ import annotations
 import ctypes
 import json
 import logging
@@ -40,120 +38,80 @@ ICON_ON = os.path.join(BASE_DIR, "icon_on.ico")
 ICON_OFF = os.path.join(BASE_DIR, "icon_off.ico")
 CONFIG_FILE = os.path.join(BASE_DIR, "keyflip.json")
 
-# --- Config helpers for file_logging / autorun / exit_hotkey ---
-def read_file_logging_flag() -> bool:
+# --- Пару глобальных помощников для безопасности при записи/чтении конфига ---
+_config_write_lock = threading.Lock()  # защищает запись в файл
+_config_cache_lock = threading.Lock()
+_config_cache: Optional[dict] = None
+_config_cache_mtime: float = 0.0
+
+def _read_config_raw() -> dict:
+    """Прочитать JSON файл (не использую кэш) — возвращает {} при ошибках."""
     try:
         if not os.path.isfile(CONFIG_FILE):
-            return False
+            return {}
         with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-            j = json.load(f)
-        return bool(j.get("file_logging", False))
-    except Exception:  # noqa
-        return False
+            return json.load(f) or {}
+    except Exception:
+        return {}
 
-def write_file_logging_flag(val: bool) -> bool:
+def _reload_config_if_needed() -> dict:
+    """
+    Возвращает кэшированный config dict. Перезагружает, если файл изменился по mtime
+    или если кэша ещё нет.
+    """
+    global _config_cache, _config_cache_mtime
     try:
-        j = {}
-        if os.path.isfile(CONFIG_FILE):
+        with _config_cache_lock:
+            if not os.path.isfile(CONFIG_FILE):
+                # файл отсутствует — сброс кэша
+                if _config_cache is None:
+                    _config_cache = {}
+                    _config_cache_mtime = 0.0
+                return dict(_config_cache)
+            m = os.path.getmtime(CONFIG_FILE)
+            if _config_cache is None or m != _config_cache_mtime:
+                # reload
+                try:
+                    with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                        j = json.load(f) or {}
+                except Exception:
+                    j = {}
+                _config_cache = j
+                _config_cache_mtime = m
+            return dict(_config_cache)
+    except Exception:
+        return {}
+
+def _atomic_write_json(path: str, obj: dict) -> bool:
+    """
+    Атомарно записывает JSON: пишем в временный файл, flush+fsync, затем os.replace.
+    Возвращает True при успехе.
+    """
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(obj, f, ensure_ascii=False, indent=2)
+            f.flush()
             try:
-                with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-                    j = json.load(f)
-            except Exception:  # noqa
-                j = {}
-        if "enabled" not in j:
-            j["enabled"] = True
-        if "autorun" not in j:
-            j["autorun"] = False
-        j["file_logging"] = bool(val)
-        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-            json.dump(j, f, ensure_ascii=False, indent=2)
-        logger.info("config: записан file_logging=%s в %s", j["file_logging"], CONFIG_FILE)
+                os.fsync(f.fileno())
+            except Exception:
+                # на некоторых файловых системах может не сработать, но это ок
+                pass
+        os.replace(tmp, path)
+        # обновим кэш
+        try:
+            with _config_cache_lock:
+                _config_cache = obj.copy()
+                _config_cache_mtime = os.path.getmtime(path)
+        except Exception:
+            pass
         return True
-    except Exception:  # noqa
-        logger.exception("config: не удалось записать file_logging в %s", CONFIG_FILE)
-        return False
-
-def read_autorun_flag() -> bool:
-    try:
-        if not os.path.isfile(CONFIG_FILE):
-            return False
-        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-            j = json.load(f)
-        return bool(j.get("autorun", False))
-    except Exception:  # noqa
-        return False
-
-def write_autorun_flag(val: bool) -> bool:
-    try:
-        j = {}
-        if os.path.isfile(CONFIG_FILE):
-            try:
-                with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-                    j = json.load(f)
-            except Exception:  # noqa
-                j = {}
-        if "enabled" not in j:
-            j["enabled"] = True
-        if "file_logging" not in j:
-            j["file_logging"] = False
-        j["autorun"] = bool(val)
-        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-            json.dump(j, f, ensure_ascii=False, indent=2)
-        logger.info("config: записан autorun=%s в %s", j["autorun"], CONFIG_FILE)
-        return True
-    except Exception:  # noqa
-        logger.exception("config: не удалось записать autorun в %s", CONFIG_FILE)
-        return False
-
-# ---- exit hotkey read/write ----
-def default_exit_hotkey() -> Dict:
-    return {"modifiers": [], "key": "F10"}
-
-def read_exit_hotkey() -> Dict:
-    """
-    Возвращает словарь {"modifiers": [...], "key": "F10"}.
-    Если не задано — возвращает значение по умолчанию.
-    """
-    try:
-        if not os.path.isfile(CONFIG_FILE):
-            return default_exit_hotkey()
-        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-            j = json.load(f)
-        eh = j.get("exit_hotkey")
-        if not isinstance(eh, dict):
-            return default_exit_hotkey()
-        mods = eh.get("modifiers", []) or []
-        key = eh.get("key", "F10") or "F10"
-        return {"modifiers": list(mods), "key": str(key)}
-    except Exception:  # noqa
-        return default_exit_hotkey()
-
-def write_exit_hotkey(modifiers: List[str], key: str) -> bool:
-    """
-    Записывает exit_hotkey в CONFIG_FILE, сохраняя остальные поля.
-    Модификаторы — список строк: CTRL, ALT, SHIFT, WIN
-    """
-    try:
-        j = {}
-        if os.path.isfile(CONFIG_FILE):
-            try:
-                with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-                    j = json.load(f)
-            except Exception:  # noqa
-                j = {}
-        if "enabled" not in j:
-            j["enabled"] = True
-        if "file_logging" not in j:
-            j["file_logging"] = False
-        if "autorun" not in j:
-            j["autorun"] = False
-        j["exit_hotkey"] = {"modifiers": modifiers, "key": key}
-        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-            json.dump(j, f, ensure_ascii=False, indent=2)
-        logger.info("config: записан exit_hotkey=%s", j["exit_hotkey"])
-        return True
-    except Exception:  # noqa
-        logger.exception("config: не удалось записать exit_hotkey в %s", CONFIG_FILE)
+    except Exception:
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except Exception:
+            pass
         return False
 
 # --- Один экземпляр (mutex) ---
@@ -173,13 +131,11 @@ handler = RotatingFileHandler(LOG_FILE, maxBytes=5 * 1024 * 1024, backupCount=3,
 fmt = logging.Formatter("%(asctime)s %(levelname)s [%(threadName)s] %(message)s", "%Y-%m-%d %H:%M:%S")
 handler.setFormatter(fmt)
 
-# прикрепляем фильтр, который читает CONFIG_FILE при каждом лог-записи
+# Фильтр: файл логов включается/выключается флагом в CONFIG_FILE
 class FileLoggingFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
-        try:
-            return read_file_logging_flag()
-        except Exception:  # noqa
-            return False
+        cfg = _reload_config_if_needed()
+        return bool(cfg.get("file_logging", False))
 
 handler.addFilter(FileLoggingFilter())
 
@@ -545,51 +501,62 @@ def safe_copy_from_selection(timeout_per_attempt: float = 0.6, max_attempts: int
     logger.warning("safe_copy: НЕ удалось получить выделение. last_exc=%r", repr(last_exception))
     return ""
 
-# ------------ Config (enabled + file defaults) ------------
+# ------------ Config (enabled + defaults) ------------
 _enabled_lock = threading.Lock()
-_enabled: bool = True  # default; will be overwritten by load_config()
+_enabled: bool = True  # default; будет перезаписан load_config()
+
+def default_exit_hotkey() -> Dict:
+    return {"modifiers": [], "key": "F10"}
 
 def load_config():
-    global _enabled
-    changed = False
-    if os.path.isfile(CONFIG_FILE):
-        try:
-            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-                j = json.load(f)
-        except Exception:  # noqa
-            j = {}
+    """
+    Загружает keyflip.json (создаёт с дефолтами, если нет).
+    Устанавливает _enabled и гарантирует, что в файле есть file_logging/autorun/exit_hotkey.
+    """
+    try:
+        j = _read_config_raw()
+        changed = False
+        if "enabled" not in j:
+            j["enabled"] = True
             changed = True
-    else:
-        j = {}
-        changed = True
-    if "enabled" not in j:
-        j["enabled"] = True
-        changed = True
-    _enabled = bool(j["enabled"])
-    if "file_logging" not in j:
-        j["file_logging"] = False
-        changed = True
-    if "autorun" not in j:
-        j["autorun"] = False
-        changed = True
-    if "exit_hotkey" not in j:
-        j["exit_hotkey"] = default_exit_hotkey()
-        changed = True
-    if changed:
-        try:
-            with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-                json.dump(j, f, ensure_ascii=False, indent=2)
-        except Exception:  # noqa
-            logger.exception("config: failed to write %s", CONFIG_FILE)
+        if "file_logging" not in j:
+            j["file_logging"] = False
+            changed = True
+        if "autorun" not in j:
+            j["autorun"] = False
+            changed = True
+        if "exit_hotkey" not in j:
+            j["exit_hotkey"] = default_exit_hotkey()
+            changed = True
+        if changed:
+            # атомарно записываем
+            with _config_write_lock:
+                _atomic_write_json(CONFIG_FILE, j)
+        # применим enabled в память
+        global _enabled
+        with _enabled_lock:
+            _enabled = bool(j.get("enabled", True))
+        # обновим кэш сразу
+        with _config_cache_lock:
+            global _config_cache, _config_cache_mtime
+            _config_cache = j.copy()
+            try:
+                _config_cache_mtime = os.path.getmtime(CONFIG_FILE)
+            except Exception:
+                _config_cache_mtime = 0.0
+    except Exception:
+        logger.exception("config: load_config unexpected exception; using defaults")
+        with _enabled_lock:
+            _enabled = True
 
 def save_config():
     try:
         with _enabled_lock:
             j = {"enabled": bool(_enabled)}
-        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-            json.dump(j, f)
+        with _config_write_lock:
+            _atomic_write_json(CONFIG_FILE, j)
         logger.debug("config: saved enabled=%s to %s", j["enabled"], CONFIG_FILE)
-    except Exception:  # noqa
+    except Exception:
         logger.exception("config: save failed")
 
 def is_enabled() -> bool:
@@ -603,10 +570,93 @@ def set_enabled(val: bool):
     save_config()
     logger.info("state: enabled set to %s", _enabled)
 
+# Функции чтения/записи отдельных флагов используют кэш и атомарную запись
+def read_file_logging_flag() -> bool:
+    cfg = _reload_config_if_needed()
+    return bool(cfg.get("file_logging", False))
+
+def write_file_logging_flag(val: bool) -> bool:
+    with _config_write_lock:
+        j = _reload_config_if_needed()
+        j["file_logging"] = bool(val)
+        # оставляем enabled/autorun/exit_hotkey как есть
+        ok = _atomic_write_json(CONFIG_FILE, j)
+        if ok:
+            logger.info("config: записан file_logging=%s в %s", j["file_logging"], CONFIG_FILE)
+        else:
+            logger.exception("config: не удалось записать file_logging в %s", CONFIG_FILE)
+        return ok
+
+def read_autorun_flag() -> bool:
+    cfg = _reload_config_if_needed()
+    return bool(cfg.get("autorun", False))
+
+def write_autorun_flag(val: bool) -> bool:
+    with _config_write_lock:
+        j = _reload_config_if_needed()
+        j["autorun"] = bool(val)
+        ok = _atomic_write_json(CONFIG_FILE, j)
+        if ok:
+            logger.info("config: записан autorun=%s в %s", j["autorun"], CONFIG_FILE)
+        else:
+            logger.exception("config: не удалось записать autorun в %s", CONFIG_FILE)
+        return ok
+
+def read_exit_hotkey() -> Dict:
+    """
+    Возвращает {"modifiers":[...], "key":"F10"} — без поддержки list-формата.
+    """
+    cfg = _reload_config_if_needed()
+    eh = cfg.get("exit_hotkey")
+    if not isinstance(eh, dict):
+        return default_exit_hotkey()
+    mods = eh.get("modifiers", []) or []
+    key = eh.get("key", "F10") or "F10"
+    return {"modifiers": list(mods), "key": str(key)}
+
+def normalize_modifiers(modifiers: List[str]) -> List[str]:
+    """
+    Нормализует список модификаторов: uppercase, CONTROL->CTRL, убирает дубли, сохраняет порядок.
+    Допустимые: CTRL, ALT, SHIFT, WIN
+    """
+    out = []
+    seen = set()
+    for m in modifiers:
+        if not m:
+            continue
+        mm = str(m).upper()
+        if mm == "CONTROL":
+            mm = "CTRL"
+        if mm == "WINDOWS":
+            mm = "WIN"
+        if mm not in ("CTRL", "ALT", "SHIFT", "WIN"):
+            continue
+        if mm in seen:
+            continue
+        seen.add(mm)
+        out.append(mm)
+    return out
+
+def write_exit_hotkey(modifiers: List[str], key: str) -> bool:
+    """
+    Записывает exit_hotkey в CONFIG_FILE (атомарно). Нормализует модификаторы.
+    """
+    mods = normalize_modifiers(modifiers or [])
+    key = (key or "F10").upper()
+    with _config_write_lock:
+        j = _reload_config_if_needed()
+        j["exit_hotkey"] = {"modifiers": mods, "key": key}
+        ok = _atomic_write_json(CONFIG_FILE, j)
+        if ok:
+            logger.info("config: записан exit_hotkey=%s", j["exit_hotkey"])
+        else:
+            logger.exception("config: не удалось записать exit_hotkey в %s", CONFIG_FILE)
+        return ok
+
 # Load config on startup
 load_config()
 
-# Применяем autorun согласно настройке в файле (если пользователь вручную изменил файл)
+# ---------------- startup shortcut helpers ----------------
 def _startup_shortcut_path() -> str:
     appdata = os.environ.get("APPDATA")
     if not appdata:
@@ -619,7 +669,7 @@ def create_startup_shortcut() -> bool:
     try:
         try:
             import win32com.client  # type: ignore
-        except Exception:  # noqa
+        except Exception:
             logger.exception("create_startup_shortcut: win32com.client недоступен, не могу создать ярлык")
             return False
         shell = win32com.client.Dispatch("WScript.Shell")
@@ -639,7 +689,7 @@ def create_startup_shortcut() -> bool:
         shortcut.Save()
         logger.info("startup: ярлык создан: %s", shortcut_path)
         return True
-    except Exception:  # noqa
+    except Exception:
         logger.exception("startup: не удалось создать ярлык автозагрузки")
         return False
 
@@ -652,7 +702,7 @@ def remove_startup_shortcut() -> bool:
         else:
             logger.debug("startup: ярлык не найден: %s", sp)
         return True
-    except Exception:  # noqa
+    except Exception:
         logger.exception("startup: не удалось удалить ярлык: %s", sp)
         return False
 
@@ -663,20 +713,19 @@ def apply_autorun_setting() -> None:
             create_startup_shortcut()
         else:
             remove_startup_shortcut()
-    except Exception:  # noqa
+    except Exception:
         logger.exception("apply_autorun_setting: ошибка при применении autorun")
 
+# Применим autorun при старте
 try:
     apply_autorun_setting()
-except Exception:  # noqa
+except Exception:
     logger.exception("startup: apply_autorun_setting on startup failed")
 
 # ------------ Hotkey constants & thread messaging ------------
 HOTKEY_ID_F4 = 1
 HOTKEY_ID_EXIT = 2  # id для динамической комбинации выхода
 MOD_NONE = 0
-# (оставил для совместимости, но регистрация выхода теперь динамическая)
-VK_F10 = 0x79
 
 # We'll use PostThreadMessage to request registration/unregistration in the hotkey thread
 WM_USER = 0x0400
@@ -684,7 +733,6 @@ MSG_REGISTER_F4 = WM_USER + 1
 MSG_UNREGISTER_F4 = WM_USER + 2
 MSG_UPDATE_EXIT_HOTKEY = WM_USER + 3
 
-# id потока, где вызывается win_hotkey_loop (будет установлен в начале цикла)
 HOTKEY_THREAD_ID = 0  # заполнится в win_hotkey_loop
 
 def post_register_f4(should_register: bool):
@@ -702,12 +750,11 @@ def post_register_f4(should_register: bool):
             return False
         logger.debug("post_register_f4: posted msg=%d wParam=%d to thread %d", msg, wparam, HOTKEY_THREAD_ID)
         return True
-    except Exception:  # noqa
+    except Exception:
         logger.exception("post_register_f4: exception while posting")
         return False
 
 def post_update_exit_hotkey():
-    """Просит hotkey-поток обновить/перерегистрировать хоткей выхода (читает из файла)."""
     global HOTKEY_THREAD_ID
     if HOTKEY_THREAD_ID == 0:
         logger.warning("post_update_exit_hotkey: HOTKEY_THREAD_ID not ready yet -> cannot post")
@@ -720,7 +767,7 @@ def post_update_exit_hotkey():
             return False
         logger.debug("post_update_exit_hotkey: posted MSG_UPDATE_EXIT_HOTKEY to thread %d", HOTKEY_THREAD_ID)
         return True
-    except Exception:  # noqa
+    except Exception:
         logger.exception("post_update_exit_hotkey: exception while posting")
         return False
 
@@ -733,7 +780,7 @@ def register_f4_in_thread():
         else:
             err = kernel32.GetLastError()
             logger.error("register_f4: failed to register F4 (err=%d)", err)
-    except Exception:  # noqa
+    except Exception:
         logger.exception("register_f4: exception while registering F4")
 
 def unregister_f4_in_thread():
@@ -743,7 +790,7 @@ def unregister_f4_in_thread():
             logger.debug("unregister_f4: F4 unregistered in hotkey thread")
         else:
             logger.debug("unregister_f4: UnregisterHotKey returned False (probably not registered)")
-    except Exception:  # noqa
+    except Exception:
         logger.exception("unregister_f4: exception while unregistering F4")
 
 # ------------- Exit hotkey helpers (dynamic) ----------------
@@ -760,14 +807,12 @@ VK_MAP = {
     "ESC": 0x1B, "TAB": 0x09, "RETURN": 0x0D, "ENTER": 0x0D, "SPACE": 0x20,
     "INSERT": 0x2D, "DELETE": 0x2E, "HOME": 0x24, "END": 0x23, "PGUP": 0x21, "PGDN": 0x22,
     "LEFT": 0x25, "UP": 0x26, "RIGHT": 0x27, "DOWN": 0x28,
-    # digits are mapped by ord below
-    # letters mapped by ord('A') etc.
 }
 
 def key_name_to_vk(name: str) -> int:
     n = (name or "").upper()
     if not n:
-        return VK_F10
+        return VK_MAP.get("F10", 0x79)
     if n in VK_MAP:
         return VK_MAP[n]
     if len(n) == 1:
@@ -776,15 +821,12 @@ def key_name_to_vk(name: str) -> int:
             return ord(ch)
         if '0' <= ch <= '9':
             return ord(ch)
-    # fallback: try to parse "VK_*" or numeric
     try:
         if n.startswith("VK_"):
-            # maybe user provided raw like VK_F10
             return int(getattr(win32con, n, 0))
-    except Exception:  # noqa
+    except Exception:
         pass
-    # default fallback
-    return VK_F10
+    return VK_MAP.get("F10", 0x79)
 
 def modifiers_list_to_mask(mods: List[str]) -> int:
     mask = 0
@@ -801,15 +843,10 @@ def modifiers_list_to_mask(mods: List[str]) -> int:
     return mask
 
 def update_exit_hotkey_in_thread():
-    """
-    Вызывается в hotkey-потоке: снимает старый хоткей выхода и регистрирует новый,
-    читая его из файла (read_exit_hotkey()).
-    """
     try:
-        # снимаем старый
         try:
             user32.UnregisterHotKey(None, HOTKEY_ID_EXIT)
-        except Exception:  # noqa
+        except Exception:
             pass
         eh = read_exit_hotkey()
         mods = eh.get("modifiers", []) or []
@@ -824,7 +861,7 @@ def update_exit_hotkey_in_thread():
             err = kernel32.GetLastError()
             logger.error("update_exit_hotkey_in_thread: failed to register exit hotkey (err=%d) mask=0x%X vk=0x%X",
                          err, mask, vk)
-    except Exception:  # noqa
+    except Exception:
         logger.exception("update_exit_hotkey_in_thread: exception")
 
 # ------------ Handler & Hotkey logic ------------
@@ -852,7 +889,7 @@ def _f4_invoker():
         finally:
             try:
                 _handler_lock.release()
-            except Exception:  # noqa
+            except Exception:
                 pass
     threading.Thread(target=_worker, daemon=True).start()
 
@@ -868,10 +905,10 @@ def handle_hotkey_transform():
             saved = None
             try:
                 saved = pyperclip.paste()
-            except Exception:  # noqa
+            except Exception:
                 saved = None
             logger.debug("handle: прочитал (но не буду восстанавливать) буфер text-len=%s", None if saved is None else len(saved))
-        except Exception:  # noqa
+        except Exception:
             saved = None
         try:
             hwnd = user32.GetForegroundWindow()
@@ -879,7 +916,7 @@ def handle_hotkey_transform():
             thread_id = user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid_c))
             hkl = user32.GetKeyboardLayout(thread_id) & 0xFFFF
             logger.debug("handle: foreground thread hkl=0x%04X", hkl)
-        except Exception:  # noqa
+        except Exception:
             hkl = 0
             logger.exception("handle: не удалось получить HKL, предполагаем EN")
         selected = safe_copy_from_selection(timeout_per_attempt=0.6, max_attempts=2)
@@ -900,14 +937,11 @@ def handle_hotkey_transform():
             time.sleep(0.02)
         except Exception as e:
             logger.exception("handle: delete exception: %s", e)
-
-        # вставляем через SendInput (не трогаем clipboard)
         try:
             send_unicode_via_sendinput(converted, delay_between_keys=0.001)
             logger.debug("handle: вставил через SendInput (unicode) — без использования clipboard")
         except Exception as e:
             logger.exception("handle: send_unicode_via_sendinput failed: %s", e)
-            # fallback на clipboard paste (опасно для non-text formats, но это fallback)
             try:
                 pyperclip.copy(converted)
                 time.sleep(0.02)
@@ -915,8 +949,6 @@ def handle_hotkey_transform():
                 logger.debug("handle: fallback: вставил через буфер (ctrl+v)")
             except Exception as e2:
                 logger.exception("handle: fallback paste failed: %s", e2)
-
-        # переключаем раскладку в окне (меняем на противоположную)
         try:
             if hwnd:
                 if hkl == 0x0419:
@@ -931,45 +963,36 @@ def handle_hotkey_transform():
                     try:
                         user32.ActivateKeyboardLayout(hkl_new, 0)
                         logger.debug("handle: ActivateKeyboardLayout used as fallback")
-                    except Exception:  # noqa
+                    except Exception:
                         logger.exception("handle: fallback ActivateKeyboardLayout also failed")
                 else:
                     logger.debug("handle: posted WM_INPUTLANGCHANGEREQUEST -> success")
-        except Exception:  # noqa
+        except Exception:
             logger.exception("handle: switch layout failed (foreground-thread)")
-
-        # ВАЖНО: не восстанавливаем старый буфер — оставляем то, что сейчас в clipboard (обычно выделение)
         logger.info("handle: завершено успешно. (буфер оставлен как есть — в нём будет выделение)")
     except Exception as e:
         logger.exception("handle_hotkey_transform: исключение при обработке: %s", e)
 
 # ------------ Tray / Icon (с пунктом Вкл/Выкл и иконками) ----------------
 def prepare_tray_icon_image(enabled: Optional[bool] = None) -> Image.Image:
-    """
-    Возвращает PIL.Image для трея. Если файлы icon_on/icon_off присутствуют, используем их,
-    иначе генерируем простую квадратную иконку с K и цветом (зелёный/красный).
-    """
     if enabled is None:
         enabled = is_enabled()
-
     path = ICON_ON if enabled else ICON_OFF
     if os.path.isfile(path):
         try:
             img = Image.open(path)
             logger.debug("Tray icon: using %s", path)
             return img
-        except Exception:  # noqa
+        except Exception:
             logger.exception("Tray icon: cannot open %s", path)
-
-    # fallback: draw simple image
     size = (64, 64)
-    bg = (76, 175, 80, 255) if enabled else (220, 53, 69, 255)  # green / red
+    bg = (76, 175, 80, 255) if enabled else (220, 53, 69, 255)
     img = Image.new('RGBA', size, bg)
     d = ImageDraw.Draw(img)
     try:
         d.rectangle((8, 16, 56, 48), outline=(255,255,255), width=2)
         d.text((16, 12), "KF", fill=(255,255,255))
-    except Exception:  # noqa
+    except Exception:
         pass
     return img
 
@@ -977,27 +1000,22 @@ def enabled_menu_text(item):
     return "❌ Выключить" if is_enabled() else "✅ Включить"
 
 def toggle_enabled(icon, item):
-    """Action called from tray menu: flips state, updates config and icon image immediately"""
     new_state = not is_enabled()
     set_enabled(new_state)
     logger.info("Tray: toggled enabled -> %s", new_state)
-    # Вместо прямого вызова Register/Unregister ми постим сообщение в hotkey-thread
     try:
         ok = post_register_f4(new_state)
         if not ok:
             logger.warning("toggle_enabled: post_register_f4 returned False")
-    except Exception:  # noqa
+    except Exception:
         logger.exception("toggle_enabled: failed to post register/unregister request")
-
-    # Обновляем иконку прямо сейчас (pystray Icon передаётся первым аргументом)
     try:
         if icon is not None:
             icon.icon = prepare_tray_icon_image(new_state)
-    except Exception:  # noqa
+    except Exception:
         logger.exception("Tray: failed to update icon image after toggle")
 
 def toggle_file_logging(icon, item):
-    """Переключает запись логов в файл (меняет file_logging в keyflip.json)"""
     try:
         current = read_file_logging_flag()
         new = not current
@@ -1006,11 +1024,10 @@ def toggle_file_logging(icon, item):
             logger.info("Tray: file_logging toggled -> %s", new)
         else:
             logger.warning("Tray: file_logging toggle attempted but write failed")
-    except Exception:  # noqa
+    except Exception:
         logger.exception("toggle_file_logging: исключение")
 
 def toggle_autorun(icon, item):
-    """Переключает автозапуск при старте Windows (меняет autorun в keyflip.json и применяет)"""
     try:
         current = read_autorun_flag()
         new = not current
@@ -1020,14 +1037,13 @@ def toggle_autorun(icon, item):
             apply_autorun_setting()
         else:
             logger.warning("Tray: autorun toggle attempted but write failed")
-    except Exception:  # noqa
+    except Exception:
         logger.exception("toggle_autorun: исключение")
 
 # ---- Exit hotkey menu actions
 def _set_exit_hotkey_and_apply(mods: List[str], key: str):
     ok = write_exit_hotkey(mods, key)
     if ok:
-        # попросим hotkey-поток обновить регистрацию
         post_update_exit_hotkey()
     return ok
 
@@ -1044,18 +1060,17 @@ def on_exit(icon=None, item=None):
     try:
         if icon:
             icon.stop()
-    except Exception:  # noqa
+    except Exception:
         logger.exception("on_exit: ошибка при остановке иконки")
     try:
         win32event.ReleaseMutex(mutex_handle)
-    except Exception:  # noqa
+    except Exception:
         pass
     logger.info("Завершение работы.")
     return
 
 def tray_worker():
     img = prepare_tray_icon_image()
-    # settings menu: логирование, автозапуск, комбинация выхода
     settings_menu = Menu(
         MenuItem("Логирование в файл", toggle_file_logging, checked=lambda item: read_file_logging_flag()),
         MenuItem("Автозапуск при старте Windows", toggle_autorun, checked=lambda item: read_autorun_flag()),
@@ -1095,12 +1110,10 @@ def tray_worker():
         MenuItem("Выход", on_exit)
     )
     icon = Icon(APP_NAME, img, APP_NAME, menu=menu)
-    # ensure icon image matches saved state (in case load_config changed it earlier)
     try:
         icon.icon = prepare_tray_icon_image(is_enabled())
-    except Exception:  # noqa
+    except Exception:
         logger.exception("tray_worker: failed to set initial icon")
-
     try:
         logger.debug("tray_worker: запуск иконки")
         icon.run()
@@ -1110,25 +1123,22 @@ def tray_worker():
 # ------------ WinAPI hotkey loop ------------
 def win_hotkey_loop():
     global HOTKEY_THREAD_ID
-    # устанавливаем id текущего потока — другим потокам можно будет посылать PostThreadMessageW
     try:
         HOTKEY_THREAD_ID = kernel32.GetCurrentThreadId()
         logger.debug("win_hotkey_loop: HOTKEY_THREAD_ID = %d", HOTKEY_THREAD_ID)
-    except Exception:  # noqa
+    except Exception:
         HOTKEY_THREAD_ID = 0
         logger.exception("win_hotkey_loop: failed to get thread id")
 
     # Register dynamic exit hotkey here by calling updater (so it's done in this thread)
     update_exit_hotkey_in_thread()
 
-    # Register F4 only if enabled (this registration happens in this thread's message queue)
     if is_enabled():
         register_f4_in_thread()
     else:
-        # ensure it's not registered in this thread
         try:
             user32.UnregisterHotKey(None, HOTKEY_ID_F4)
-        except Exception:  # noqa
+        except Exception:
             pass
 
     try:
@@ -1137,35 +1147,30 @@ def win_hotkey_loop():
             has = user32.GetMessageW(ctypes.byref(msg), None, 0, 0)
             if has == 0:
                 break
-
-            # обработка наших внутренних сообщений (регистрация/отмена регистрации)
             if msg.message == MSG_REGISTER_F4:
                 logger.debug("win_hotkey_loop: MSG_REGISTER_F4 received wParam=%s", int(msg.wParam))
                 try:
                     register_f4_in_thread()
-                except Exception:  # noqa
+                except Exception:
                     logger.exception("win_hotkey_loop: register_f4_in_thread failed")
-                # не DispatchMessage для этого пользовательского сообщения
                 continue
             elif msg.message == MSG_UNREGISTER_F4:
                 logger.debug("win_hotkey_loop: MSG_UNREGISTER_F4 received")
                 try:
                     unregister_f4_in_thread()
-                except Exception:  # noqa
+                except Exception:
                     logger.exception("win_hotkey_loop: unregister_f4_in_thread failed")
                 continue
             elif msg.message == MSG_UPDATE_EXIT_HOTKEY:
                 logger.debug("win_hotkey_loop: MSG_UPDATE_EXIT_HOTKEY received -> update exit hotkey")
                 try:
                     update_exit_hotkey_in_thread()
-                except Exception:  # noqa
+                except Exception:
                     logger.exception("win_hotkey_loop: update_exit_hotkey_in_thread failed")
                 continue
             if msg.message == 0x0312:  # WM_HOTKEY
                 hotkey_id = msg.wParam
                 if hotkey_id == HOTKEY_ID_F4:
-                    # если пришёл F4 — сработает только если он зарегистрирован в этом потоке
-                    # дополнительная защита: если состояние выключено — игнорируем
                     if not is_enabled():
                         logger.debug("WM_HOTKEY: F4 received but currently disabled -> ignored")
                     else:
@@ -1180,7 +1185,7 @@ def win_hotkey_loop():
         try:
             user32.UnregisterHotKey(None, HOTKEY_ID_F4)
             user32.UnregisterHotKey(None, HOTKEY_ID_EXIT)
-        except Exception:  # noqa
+        except Exception:
             pass
 
 # ------------ Main ------------
@@ -1192,12 +1197,10 @@ def main():
     t2 = threading.Thread(target=win_hotkey_loop, daemon=True, name="WinHotkeyThread")
     t2.start()
     logger.debug("main: WinAPI hotkey thread started")
-    # ensure exit hotkey matches what's in file at start (if config changed before launching)
     try:
         post_update_exit_hotkey()
-    except Exception:  # noqa
+    except Exception:
         logger.exception("main: failed to post initial update_exit_hotkey")
-
     logger.info("%s запущен. Нажми F4 чтобы преобразовать выделение", APP_NAME)
     try:
         while not exit_event.is_set():
@@ -1207,7 +1210,7 @@ def main():
     finally:
         try:
             win32event.ReleaseMutex(mutex_handle)
-        except Exception:  # noqa
+        except Exception:
             pass
         logger.info("main: завершение")
 
