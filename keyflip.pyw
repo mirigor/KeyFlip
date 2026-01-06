@@ -1270,22 +1270,60 @@ def on_exit(_icon=None, _item=None) -> None:
     logger.info("Завершение работы.")
     return
 
+def is_exit_hotkey_equal(expected_mods: list[str], expected_key: str) -> bool:
+    """
+    Сравнить сохранённую комбинацию с ожидаемой.
+    Нормализует модификаторы (верхний регистр, CTRL/ALT/SHIFT/WIN) и ключ (строгое совпадение строки).
+    """
+    eh = read_exit_hotkey()
+    saved_mods = [(m or "").upper() for m in (eh.get("modifiers") or [])]
+    saved_key = (eh.get("key") or "").upper()
+    expected_mods_norm = [(m or "").upper() for m in (expected_mods or [])]
+    expected_key_norm = (expected_key or "").upper()
+    # сравниваем множества модификаторов и ключ
+    return set(saved_mods) == set(expected_mods_norm) and saved_key == expected_key_norm
+
+def format_exit_hotkey_display(_item=None) -> str:
+    """
+    Вернуть строку для отображения текущей комбинации в меню.
+    При вызове pystray ему передаётся один аргумент (menu item), поэтому
+    принимаем необязательный параметр _item.
+    """
+    eh = read_exit_hotkey()
+    mods = eh.get("modifiers") or []
+    key = (eh.get("key") or "").upper()
+    if not key:
+        return "Текущая: (нет)"
+    if not mods:
+        if key == "F10":
+            return "Текущая: F10 (по умолчанию)"
+        return f"Текущая: {key}"
+    return f"Текущая: {'+'.join(m.upper() for m in mods)}+{key}"
+
+
 def tray_worker() -> None:
     """Запустить pystray icon + меню (в отдельном потоке)"""
     img = prepare_tray_icon_image()
     settings_menu = Menu(
+        MenuItem(format_exit_hotkey_display, None, enabled=False),
+        Menu.SEPARATOR,
         MenuItem("Логирование в файл", toggle_file_logging, checked=lambda item: read_file_logging_flag()),
         MenuItem("Автозапуск при старте Windows", toggle_autorun, checked=lambda item: read_autorun_flag()),
         MenuItem(
             "Комбинация выхода",
             Menu(
                 MenuItem("F10 (по умолчанию)", menu_set_exit_f10,
-                         checked=lambda item: (read_exit_hotkey().get("key", "") == "F10" and not read_exit_hotkey().get("modifiers"))),
+                         checked=lambda item: is_exit_hotkey_equal([], "F10")),
                 MenuItem("Ctrl+Q", menu_set_exit_ctrl_q,
-                         checked=lambda item: (read_exit_hotkey().get("key", "") == "Q" and "CTRL" in read_exit_hotkey().get("modifiers", []))),
+                         checked=lambda item: is_exit_hotkey_equal(["CTRL"], "Q")),
                 MenuItem("Ctrl+Alt+X", menu_set_exit_ctrl_alt_x,
-                         checked=lambda item: (read_exit_hotkey().get("key", "") == "X" and {"CTRL", "ALT"} == set(read_exit_hotkey().get("modifiers", [])))),
-                MenuItem("Ввести свою комбинацию...", menu_set_exit_custom_capture),
+                         checked=lambda item: is_exit_hotkey_equal(["CTRL", "ALT"], "X")),
+                MenuItem("Ввести свою комбинацию...", menu_set_exit_custom_capture,
+                         checked=lambda item: not (
+                                 is_exit_hotkey_equal([], "F10")
+                                 or is_exit_hotkey_equal(["CTRL"], "Q")
+                                 or is_exit_hotkey_equal(["CTRL", "ALT"], "X")
+                         )),
             )
         ),
     )
