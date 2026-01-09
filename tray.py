@@ -2,9 +2,11 @@
 Трэй, иконка и меню для KeyFlip.
 
 Содержит:
-- подготовка изображения для иконки
+- подготовку изображения для иконки
 - колбэки меню (вкл/выкл, логирование, автозапуск, выбор хоткеев)
 - запуск pystray Icon.run (tray_worker)
+
+Правила: русские комментарии/докстринги, аннотации функций (Python 3.10).
 """
 
 import os
@@ -39,7 +41,7 @@ from winapi import (
 
 
 # ---------------- Подготовка иконки ----------------
-def prepare_tray_icon_image(enabled=None):
+def prepare_tray_icon_image(enabled: bool | None = None) -> Image.Image:
     """
     Подготовить PIL.Image для иконки в трее (использовать ICON_ON/ICON_OFF если есть),
     иначе нарисовать простую заглушку.
@@ -68,23 +70,25 @@ def prepare_tray_icon_image(enabled=None):
 
 
 # ---------------- Меню: утилиты ----------------
-def enabled_menu_text(_item=None) -> str:
-    """Текст пункта меню Вкл/Выкл в зависимости от состояния"""
+def enabled_menu_text(_item: MenuItem | None = None) -> str:
+    """Текст пункта меню 'Вкл/Выкл' в зависимости от состояния."""
     return "❌ Выключить" if is_enabled() else "✅ Включить"
 
 
-def toggle_enabled(_icon, _item) -> None:
+def toggle_enabled(_icon: Icon | None, _item: MenuItem | None) -> None:
     """Переключить глобальное включение/выключение приложения и обновить иконку."""
     try:
         new_state = not is_enabled()
         set_enabled(new_state)
         logger.info("Tray: toggled enabled -> %s", new_state)
+
         try:
             ok = post_register_translate(new_state)
             if not ok:
                 logger.warning("toggle_enabled: post_register_translate returned False")
         except Exception:  # noqa
-            logger.exception("toggle_enabled: failed to post register/unregister request")
+            logger.exception("_safe_post_register_translate: failed to post register/unregister request")
+
         # обновление иконки (если вызов пришёл из pystray)
         try:
             if _icon is not None:
@@ -95,7 +99,7 @@ def toggle_enabled(_icon, _item) -> None:
         logger.exception("toggle_enabled: exception")
 
 
-def toggle_file_logging(_icon, _item) -> None:
+def toggle_file_logging(_icon: Icon | None, _item: MenuItem | None) -> None:
     """Переключить логирование в файл (чтение/запись в конфиг)."""
     try:
         current = read_file_logging_flag()
@@ -109,7 +113,7 @@ def toggle_file_logging(_icon, _item) -> None:
         logger.exception("toggle_file_logging: exception")
 
 
-def toggle_autorun(_icon, _item) -> None:
+def toggle_autorun(_icon: Icon | None, _item: MenuItem | None) -> None:
     """Переключить автозапуск: создать/удалить ярлык и записать в конфиг."""
     try:
         current = read_autorun_flag()
@@ -128,26 +132,29 @@ def toggle_autorun(_icon, _item) -> None:
 
 
 # ---------------- Хоткеи: сравнение / форматирование ----------------
-def _normalize_mods(mods):
+def _normalize_mods(mods: list | None) -> set[str]:
+    """Нормализовать список модификаторов в set строк в верхнем регистре."""
     return set((m or "").upper() for m in (mods or []))
 
 
-def hotkey_lists_equal(a_mods, a_key, b_mods, b_key):
+def hotkey_lists_equal(a_mods: list | None, a_key: str, b_mods: list | None, b_key: str) -> bool:
     """Сравнить две комбинации модификаторов+клавиша (нормализуя)."""
     return _normalize_mods(a_mods) == _normalize_mods(b_mods) and ((a_key or "").upper() == (b_key or "").upper())
 
 
 def is_exit_hotkey_equal(expected_mods: list[str], expected_key: str) -> bool:
+    """Проверить, совпадает ли текущая exit-комбинация с ожидаемой."""
     eh = read_exit_hotkey()
     return hotkey_lists_equal(eh.get("modifiers", []) or [], eh.get("key", ""), expected_mods, expected_key)
 
 
 def is_translate_hotkey_equal(expected_mods: list[str], expected_key: str) -> bool:
+    """Проверить, совпадает ли текущая translate-комбинация с ожидаемой."""
     th = read_translate_hotkey()
     return hotkey_lists_equal(th.get("modifiers", []) or [], th.get("key", ""), expected_mods, expected_key)
 
 
-def format_exit_hotkey_display(_item=None) -> str:
+def format_exit_hotkey_display(_item: MenuItem | None = None) -> str:
     """Формат строки для отображения комбинации выхода в трее."""
     eh = read_exit_hotkey()
     mods = eh.get("modifiers") or []
@@ -161,7 +168,7 @@ def format_exit_hotkey_display(_item=None) -> str:
     return f"Выход: {'+'.join(m.upper() for m in mods)}+{key}"
 
 
-def format_translate_hotkey_display(_item=None) -> str:
+def format_translate_hotkey_display(_item: MenuItem | None = None) -> str:
     """Формат строки для отображения комбинации перевода в трее."""
     th = read_translate_hotkey()
     mods = th.get("modifiers") or []
@@ -176,7 +183,7 @@ def format_translate_hotkey_display(_item=None) -> str:
 
 
 # ---------------- Запись хоткеев с проверкой конфликтов ----------------
-def _show_conflict_messagebox(msg):
+def _show_conflict_messagebox(msg: str) -> None:
     """Локальный MessageBox (попытка, без краха при ошибке)."""
     try:
         win32api.MessageBox(0, msg, "KeyFlip", 0)
@@ -185,7 +192,7 @@ def _show_conflict_messagebox(msg):
         logger.debug("MessageBox not available for: %s", msg)
 
 
-def _set_hotkey_and_apply(mods, key, target):
+def _set_hotkey_and_apply(mods: list[str], key: str, target: str) -> bool:
     """
     Установить хоткей и применить:
     - target == 'exit' -> write_exit_hotkey + post_update_exit_hotkey
@@ -219,9 +226,13 @@ def _set_hotkey_and_apply(mods, key, target):
         return False
 
 
-# фабрика для создания пресетных колбэков меню (уменьшает повторение)
-def _make_preset_setter(mods, key, target):
-    def _fn(_icon, _item):
+def _make_preset_setter(mods: list[str], key: str, target: str) -> object:
+    """
+    Фабрика для создания пресетных колбэков меню (уменьшает повторение).
+    Возвращает функцию-подходящую для pystray (callback).
+    """
+
+    def _fn(_icon: Icon | None, _item: MenuItem | None) -> None:
         try:
             _set_hotkey_and_apply(mods, key, target)
         except Exception:  # noqa
@@ -240,7 +251,7 @@ menu_set_translate_ctrl_alt_t = _make_preset_setter(["CTRL", "ALT"], "T", "trans
 menu_set_translate_ctrl_shift_y = _make_preset_setter(["CTRL", "SHIFT"], "Y", "translate")
 
 
-def menu_set_exit_custom_capture(_icon, _item):
+def menu_set_exit_custom_capture(_icon: Icon | None, _item: MenuItem | None) -> None:
     """Поймать комбинацию для выхода в отдельном потоке."""
     try:
         capture_hotkey_and_apply_via_thread("exit")
@@ -248,7 +259,7 @@ def menu_set_exit_custom_capture(_icon, _item):
         logger.exception("menu_set_exit_custom_capture: исключение при запуске capture thread")
 
 
-def menu_set_translate_custom_capture(_icon, _item):
+def menu_set_translate_custom_capture(_icon: Icon | None, _item: MenuItem | None) -> None:
     """Поймать комбинацию для перевода в отдельном потоке."""
     try:
         capture_hotkey_and_apply_via_thread("translate")
@@ -257,7 +268,7 @@ def menu_set_translate_custom_capture(_icon, _item):
 
 
 # ---------------- Выход через трей ----------------
-def on_exit(_icon=None, _item=None):
+def on_exit(_icon: Icon | None = None, _item: MenuItem | None = None) -> None:
     """
     Завершить работу приложения (через трей).
     Устанавливаем exit_event и останавливаем иконку.
@@ -275,7 +286,7 @@ def on_exit(_icon=None, _item=None):
 
 
 # ---------------- Tray worker ----------------
-def tray_worker():
+def tray_worker() -> None:
     """
     Запустить pystray icon + меню (в отдельном потоке).
     Предназначен для запуска как daemon-поток.
