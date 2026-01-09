@@ -40,10 +40,30 @@ for k, v in list(EN_TO_RU.items()):
     if k.isalpha():
         EN_TO_RU[k.upper()] = v.upper()
 
+# Обратная мапа RU -> EN
 RU_TO_EN: dict[str, str] = {v: k for k, v in EN_TO_RU.items()}
 # Убедимся, что 'ё' и 'Ё' также присутствуют (особенности маппинга)
 RU_TO_EN['ё'] = '`'
 RU_TO_EN['Ё'] = '~'
+
+
+# ---------------- Вспомогательные функции ----------------
+def _select_mappings_by_hkl(hkl: int) -> tuple[dict[str, str], dict[str, str], str]:
+    """
+    Выбрать маппинги (mapping, reverse, prefer) по HKL.
+    Возвращает (mapping, reverse, prefer_name).
+    """
+    try:
+        lang = hkl & 0xFFFF
+    except Exception:  # noqa
+        logger.exception("_select_mappings_by_hkl: не удалось вычислить lang из hkl")
+        lang = 0
+
+    if lang == 0x0419:
+        # Если текущая раскладка русская — преобразуем RU->EN
+        return RU_TO_EN, EN_TO_RU, "RU->EN"
+    # Иначе — EN->RU
+    return EN_TO_RU, RU_TO_EN, "EN->RU"
 
 
 # ---------------- Логика преобразования ----------------
@@ -52,36 +72,27 @@ def transform_text_by_keyboard_layout_based_on_hkl(s: str, hkl: int) -> str:
     Преобразовать строку `s` в соответствии с текущей раскладкой, определяемой по HKL.
     Если LANGID == 0x0419 (русский) — выполняем RU->EN, иначе EN->RU.
 
-    Возвращает преобразованную строку. Логирует, какая мапа использована.
-    """
-    try:
-        lang = hkl & 0xFFFF
-    except Exception:
-        lang = 0
+    Аргументы:
+        s: исходная строка
+        hkl: значение HKL (обычно получаемое через GetKeyboardLayout)
 
-    if lang == 0x0419:
-        mapping = RU_TO_EN
-        reverse = EN_TO_RU
-        prefer = 'RU->EN'
-    else:
-        mapping = EN_TO_RU
-        reverse = RU_TO_EN
-        prefer = 'EN->RU'
+    Возвращает:
+        преобразованную строку
+    """
+    mapping, reverse, prefer = _select_mappings_by_hkl(hkl)
 
     out_chars: list[str] = []
     for ch in s:
-        # если символ есть в выбранной мапе — используем её
+        # сначала пробуем основную мапу
         if ch in mapping:
             out_chars.append(mapping[ch])
             continue
-        # если символ есть в обратной мапе — это значит, что пользователь ввёл уже в другой раскладке,
-        # поэтому пробуем заменить на обратный символ (поддержка ситуаций, когда пользователь
-        # перепутал раскладку дважды)
+        # затем пробуем обратную (поддержка случаев двойной путаницы раскладки)
         if ch in reverse:
             out_chars.append(reverse[ch])
             continue
-        # иначе — оставляем символ без изменений
+        # иначе — оставляем символ как есть
         out_chars.append(ch)
 
     logger.debug("transform: used %s mapping", prefer)
-    return ''.join(out_chars)
+    return "".join(out_chars)
