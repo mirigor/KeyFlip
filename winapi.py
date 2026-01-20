@@ -8,6 +8,7 @@ WinAPI-слой для KeyFlip.
 - low-level keyboard hook для захвата комбинации
 - регистрация глобальных hotkey'ов (RegisterHotKey) и Windows message loop для них
 - обработчик translate (вызов transform и вставка через SendInput)
+- обработчик case (изменение регистра) — добавлено
 """
 
 import ctypes
@@ -26,12 +27,14 @@ import win32con
 from config import (
     read_translate_hotkey,
     read_exit_hotkey,
+    read_case_hotkey,
     write_translate_hotkey,
     write_exit_hotkey,
+    write_case_hotkey,
     is_enabled,
 )
 from logging_setup import logger
-from transform import transform_text_by_keyboard_layout_based_on_hkl
+from transform import transform_text_by_keyboard_layout_based_on_hkl, change_case_by_logic
 
 # ---------------- ctypes helpers ----------------
 user32 = ctypes.windll.user32
@@ -62,6 +65,7 @@ WM_SYSKEYUP = 0x0105
 # Hotkey ids и сообщения
 HOTKEY_ID_TRANSLATE = 1
 HOTKEY_ID_EXIT = 2
+HOTKEY_ID_CASE = 3
 MOD_NONE = 0
 
 WM_USER = 0x0400
@@ -69,6 +73,9 @@ MSG_REGISTER_TRANSLATE = WM_USER + 1
 MSG_UNREGISTER_TRANSLATE = WM_USER + 2
 MSG_UPDATE_EXIT_HOTKEY = WM_USER + 3
 MSG_UPDATE_TRANSLATE_HOTKEY = WM_USER + 4
+MSG_REGISTER_CASE = WM_USER + 5
+MSG_UNREGISTER_CASE = WM_USER + 6
+MSG_UPDATE_CASE_HOTKEY = WM_USER + 7
 
 HOTKEY_THREAD_ID = 0
 
@@ -624,7 +631,7 @@ def handle_hotkey_transform() -> None:
         except Exception:  # noqa
             logger.exception("handle: switch layout failed (foreground-thread)")
 
-        logger.info("handle: завершено успешно. (буфер оставлен как есть — в нём будет выделение)")
+        logger.info("handle: завершено успешно.")
     except Exception as e:  # noqa
         logger.exception("handle_hotkey_transform: исключение при обработке: %s", e)
     finally:
@@ -634,6 +641,110 @@ def handle_hotkey_transform() -> None:
                 _restore_modifiers_from_vks(pressed_vks)
         except Exception:  # noqa
             logger.exception("handle: failed to restore modifiers")
+
+
+# ---------------- Case handler (debounce + worker) ----------------
+def _case_invoker() -> None:
+    """Дебаунс и запуск worker-потока для обработки case hotkey."""
+    global _last_translate_ts
+    if not is_enabled():
+        logger.debug("Case: ignored because enabled==False")
+        return
+    now = time.time()
+    if now - _last_translate_ts < _TRANSLATE_DEBOUNCE_SEC:
+        logger.debug("Case: debounce ignored (delta=%.3f)", now - _last_translate_ts)
+        return
+    _last_translate_ts = now
+    if not _handler_lock.acquire(blocking=False):
+        logger.debug("Case: handler busy, ignored")
+        return
+
+    def _worker() -> None:
+        try:
+            handle_hotkey_case()
+        finally:
+            try:
+                _handler_lock.release()
+            except Exception:  # noqa
+                pass
+
+    threading.Thread(target=_worker, daemon=True).start()
+
+
+def handle_hotkey_case() -> None:
+    """Прочитать выделение, изменить регистр и вставить обратно."""
+    logger.info("Case обработка — начинаю изменение регистра выделения")
+    pressed_vks: set[int] = set()
+    try:
+        if not is_enabled():
+            logger.debug("handle_case: disabled, returning")
+            return
+        title, pid, proc_name = get_active_window_info()
+        logger.info("handle_case: active window: %r pid=%s proc=%r", title, pid, proc_name)
+        try:
+            try:
+                saved = pyperclip.paste()
+            except Exception:  # noqa
+                saved = None
+            logger.debug("handle_case: прочитал (но не буду восстанавливать) буфер text-len=%s",
+                         None if saved is None else len(saved))
+        except Exception:  # noqa
+            pass
+
+        res = safe_copy_from_selection(timeout_per_attempt=0.6, max_attempts=2)
+        if isinstance(res, tuple):
+            selected, pressed_vks = res
+        else:
+            selected = res
+            pressed_vks = set()
+
+        if selected is None:
+            selected = ""
+        if not isinstance(pressed_vks, set):
+            try:
+                pressed_vks = set(pressed_vks or [])
+            except Exception:  # noqa
+                pressed_vks = set()
+
+        logger.info("handle_case: прочитано выделение (len=%d)", len(selected))
+        if not selected:
+            logger.info("handle_case: выделение пустое — ничего не делаю.")
+            return
+
+        converted = change_case_by_logic(selected)
+        if converted == selected:
+            logger.info("handle_case: регистр не изменился — ничего не делаю.")
+            return
+
+        try:
+            send_delete()
+            time.sleep(0.02)
+        except Exception as e:  # noqa
+            logger.exception("handle_case: delete exception: %s", e)
+
+        try:
+            send_unicode_via_sendinput(converted, delay_between_keys=0.001)
+            logger.debug("handle_case: вставил через SendInput (unicode)")
+        except Exception as e:  # noqa
+            logger.exception("handle_case: send_unicode_via_sendinput failed: %s", e)
+            try:
+                pyperclip.copy(converted)
+                time.sleep(0.02)
+                send_ctrl_v()
+                logger.debug("handle_case: fallback: вставил через буфер (ctrl+v)")
+            except Exception as e2:  # noqa
+                logger.exception("handle_case: fallback paste failed: %s", e2)
+
+        logger.info("handle_case: завершено успешно.")
+    except Exception as e:  # noqa
+        logger.exception("handle_hotkey_case: исключение при обработке: %s", e)
+    finally:
+        try:
+            if pressed_vks:
+                logger.debug("handle_case: restoring previously released modifiers vks=%r", pressed_vks)
+                _restore_modifiers_from_vks(pressed_vks)
+        except Exception:  # noqa
+            logger.exception("handle_case: failed to restore modifiers")
 
 
 # ---------------- Hotkey messaging helpers ----------------
@@ -698,6 +809,44 @@ def post_update_translate_hotkey() -> bool:
         return True
     except Exception:  # noqa
         logger.exception("post_update_translate_hotkey: exception while posting")
+        return False
+
+
+def post_register_case(should_register: bool) -> bool:
+    """Послать потоковое сообщение для регистрации/отмены комбинации перевода."""
+    global HOTKEY_THREAD_ID
+    if not _post_thread_message_check_thread():
+        return False
+    msg = MSG_REGISTER_CASE if should_register else MSG_UNREGISTER_CASE
+    wparam = 1 if should_register else 0
+    try:
+        res = user32.PostThreadMessageW(HOTKEY_THREAD_ID, msg, wparam, 0)
+        if res == 0:
+            err = kernel32.GetLastError()
+            logger.error("post_register_case: PostThreadMessageW failed (err=%d)", err)
+            return False
+        logger.debug("post_register_case: posted msg=%d wParam=%d to thread %d", msg, wparam, HOTKEY_THREAD_ID)
+        return True
+    except Exception:  # noqa
+        logger.exception("post_register_case: exception while posting")
+        return False
+
+
+def post_update_case_hotkey() -> bool:
+    """Послать сообщение для обновления case-hotkey в hotkey-потоке."""
+    global HOTKEY_THREAD_ID
+    if not _post_thread_message_check_thread():
+        return False
+    try:
+        res = user32.PostThreadMessageW(HOTKEY_THREAD_ID, MSG_UPDATE_CASE_HOTKEY, 0, 0)
+        if res == 0:
+            err = kernel32.GetLastError()
+            logger.error("post_update_case_hotkey: PostThreadMessageW failed (err=%d)", err)
+            return False
+        logger.debug("post_update_case_hotkey: posted MSG_UPDATE_CASE_HOTKEY to thread %d", HOTKEY_THREAD_ID)
+        return True
+    except Exception:  # noqa
+        logger.exception("post_update_case_hotkey: exception while posting")
         return False
 
 
@@ -777,6 +926,21 @@ def update_exit_hotkey_in_thread() -> None:
                 pass
             return
 
+        case = read_case_hotkey()
+        case_mask, case_vk = hotkey_tuple_from_config(case.get("modifiers", []) or [], case.get("key", "U"))
+        if hotkeys_conflict(mask, vk, case_mask, case_vk):
+            logger.error("update_exit_hotkey_in_thread: конфликт с case hotkey; пропускаю регистрацию exit")
+            try:
+                win32api.MessageBox(
+                    0,
+                    f"Не удалось зарегистрировать комбинацию выхода {'+'.join(mods) + '+' if mods else ''}{key} — конфликт с комбинацией изменения регистра.",
+                    "KeyFlip",
+                    0,
+                )
+            except Exception:  # noqa
+                pass
+            return
+
         ok = user32.RegisterHotKey(None, HOTKEY_ID_EXIT, mask, vk)
         if ok:
             logger.debug(
@@ -838,6 +1002,21 @@ def update_translate_hotkey_in_thread() -> None:
                 pass
             return
 
+        case = read_case_hotkey()
+        case_mask, case_vk = hotkey_tuple_from_config(case.get("modifiers", []) or [], case.get("key", "U"))
+        if hotkeys_conflict(mask, vk, case_mask, case_vk):
+            logger.error("update_translate_hotkey_in_thread: конфликт с case hotkey; пропускаю регистрацию translate")
+            try:
+                win32api.MessageBox(
+                    0,
+                    f"Не удалось зарегистрировать комбинацию перевода {'+'.join(mods) + '+' if mods else ''}{key} — конфликт с комбинацией изменения регистра.",
+                    "KeyFlip",
+                    0,
+                )
+            except Exception:  # noqa
+                pass
+            return
+
         ok = user32.RegisterHotKey(None, HOTKEY_ID_TRANSLATE, mask, vk)
         if ok:
             logger.debug(
@@ -866,6 +1045,67 @@ def update_translate_hotkey_in_thread() -> None:
                 pass
     except Exception:  # noqa
         logger.exception("update_translate_hotkey_in_thread: exception")
+
+
+
+def update_case_hotkey_in_thread() -> None:
+    """В hotkey-потоке: снять старую комбинацию case и зарегистрировать новую."""
+    try:
+        try:
+            user32.UnregisterHotKey(None, HOTKEY_ID_CASE)
+        except Exception:  # noqa
+            pass
+        ch = read_case_hotkey()
+        mods = ch.get("modifiers", []) or []
+        key = ch.get("key", "U") or "U"
+        mask, vk = hotkey_tuple_from_config(mods, key)
+
+        th = read_translate_hotkey()
+        th_mask, th_vk = hotkey_tuple_from_config(th.get("modifiers", []) or [], th.get("key", "F4"))
+        if hotkeys_conflict(mask, vk, th_mask, th_vk):
+            logger.error("update_exit_hotkey_in_thread: конфликт с translate hotkey; пропускаю регистрацию case")
+            try:
+                win32api.MessageBox(
+                    0,
+                    f"Не удалось зарегистрировать комбинацию выхода {'+'.join(mods) + '+' if mods else ''}{key} — конфликт с комбинацией перевода.",
+                    "KeyFlip",
+                    0,
+                )
+            except Exception:  # noqa
+                pass
+            return
+
+        eh = read_exit_hotkey()
+        eh_mask, eh_vk = hotkey_tuple_from_config(eh.get("modifiers", []) or [], eh.get("key", "F10"))
+        if hotkeys_conflict(mask, vk, eh_mask, eh_vk):
+            logger.error("update_translate_hotkey_in_thread: конфликт с exit hotkey; пропускаю регистрацию case")
+            try:
+                win32api.MessageBox(
+                    0,
+                    f"Не удалось зарегистрировать комбинацию перевода {'+'.join(mods) + '+' if mods else ''}{key} — конфликт с комбинацией выхода.",
+                    "KeyFlip",
+                    0,
+                )
+            except Exception:  # noqa
+                pass
+            return
+
+        ok = user32.RegisterHotKey(None, HOTKEY_ID_CASE, mask, vk)
+        if ok:
+            logger.debug("update_case_hotkey_in_thread: registered case hotkey %s + %s (mask=0x%X vk=0x%X)",
+                         "+".join(mods) if mods else "(no modifiers)", key, mask, vk)
+        else:
+            err = kernel32.GetLastError()
+            logger.error("update_case_hotkey_in_thread: failed to register case hotkey (err=%d) mask=0x%X vk=0x%X",
+                         err, mask, vk)
+            try:
+                win32api.MessageBox(0,
+                                    f"Не удалось зарегистрировать комбинацию регистра {'+'.join(mods) + '+' if mods else ''}{key}.\nКод ошибки: {err}",
+                                    "KeyFlip", 0)
+            except Exception:  # noqa
+                pass
+    except Exception:  # noqa
+        logger.exception("update_case_hotkey_in_thread: exception")
 
 
 # ---------------- Low-level hook structures and hook proc ----------------
@@ -1071,7 +1311,7 @@ def hotkey_lists_equal(a_mods: list | None, a_key: str, b_mods: list | None, b_k
 def capture_hotkey_and_apply_via_thread(target: str) -> None:
     """
     Запустить поток, который захватит комбинацию, затем запишет её в конфиг.
-    target: 'exit' или 'translate'
+    target: 'exit' или 'translate' или 'case'
     """
 
     def _runner() -> None:
@@ -1097,6 +1337,19 @@ def capture_hotkey_and_apply_via_thread(target: str) -> None:
                     pass
                 logger.info("Capture thread: попытка установки exit hotkey отклонена — конфликт с translate")
                 return
+            other2 = read_case_hotkey()
+            if hotkey_lists_equal(mods, key, other2.get("modifiers", []) or [], other2.get("key", "")):
+                try:
+                    win32api.MessageBox(
+                        0,
+                        f"Нельзя установить комбинацию регистра {'+'.join(mods) + '+' if mods else ''}{key} — она уже используется для изменения регистра.",
+                        "KeyFlip",
+                        0
+                    )
+                except Exception:  # noqa
+                    pass
+                logger.info("Capture thread: попытка установки translate hotkey отклонена — конфликт с case")
+                return
             ok = write_exit_hotkey(mods, key)
             if ok:
                 post_update_exit_hotkey()
@@ -1107,7 +1360,7 @@ def capture_hotkey_and_apply_via_thread(target: str) -> None:
                 )
             else:
                 logger.warning("Capture thread: не удалось записать новую комбинацию выхода")
-        else:  # translate
+        elif target == "translate":
             other = read_exit_hotkey()
             if hotkey_lists_equal(mods, key, other.get("modifiers", []) or [], other.get("key", "")):
                 try:
@@ -1121,6 +1374,19 @@ def capture_hotkey_and_apply_via_thread(target: str) -> None:
                     pass
                 logger.info("Capture thread: попытка установки translate hotkey отклонена — конфликт с exit")
                 return
+            other2 = read_case_hotkey()
+            if hotkey_lists_equal(mods, key, other2.get("modifiers", []) or [], other2.get("key", "")):
+                try:
+                    win32api.MessageBox(
+                        0,
+                        f"Нельзя установить комбинацию регистра {'+'.join(mods) + '+' if mods else ''}{key} — она уже используется для изменения регистра.",
+                        "KeyFlip",
+                        0
+                    )
+                except Exception:  # noqa
+                    pass
+                logger.info("Capture thread: попытка установки translate hotkey отклонена — конфликт с case")
+                return
             ok = write_translate_hotkey(mods, key)
             if ok:
                 post_update_translate_hotkey()
@@ -1131,8 +1397,47 @@ def capture_hotkey_and_apply_via_thread(target: str) -> None:
                 )
             else:
                 logger.warning("Capture thread: не удалось записать новую комбинацию перевода")
+        elif target == "case":
+            other = read_exit_hotkey()
+            if hotkey_lists_equal(mods, key, other.get("modifiers", []) or [], other.get("key", "")):
+                try:
+                    win32api.MessageBox(
+                        0,
+                        f"Нельзя установить комбинацию регистра {'+'.join(mods) + '+' if mods else ''}{key} — она уже используется для выхода.",
+                        "KeyFlip",
+                        0
+                    )
+                except Exception:  # noqa
+                    pass
+                logger.info("Capture thread: попытка установки case hotkey отклонена — конфликт с exit")
+                return
+            other2 = read_translate_hotkey()
+            if hotkey_lists_equal(mods, key, other2.get("modifiers", []) or [], other2.get("key", "")):
+                try:
+                    win32api.MessageBox(
+                        0,
+                        f"Нельзя установить комбинацию регистра {'+'.join(mods) + '+' if mods else ''}{key} — она уже используется для перевода.",
+                        "KeyFlip",
+                        0
+                    )
+                except Exception:  # noqa
+                    pass
+                logger.info("Capture thread: попытка установки case hotkey отклонена — конфликт с translate")
+                return
+            ok = write_case_hotkey(mods, key)
+            if ok:
+                post_update_case_hotkey()
+                logger.info(
+                    "Capture thread: установлена новая комбинация регистра: %s + %s",
+                    "+".join(mods) if mods else "(none)",
+                    key
+                )
+            else:
+                logger.warning("Capture thread: не удалось записать новую комбинацию регистра")
+        else:
+            logger.warning("Capture thread: неизвестная цель capture: %r", target)
 
-    name = "ExitCaptureThread" if target == "exit" else "TranslateCaptureThread"
+    name = "ExitCaptureThread" if target == "exit" else ("TranslateCaptureThread" if target == "translate" else "CaseCaptureThread")
     t = threading.Thread(target=_runner, daemon=True, name=name)
     t.start()
 
@@ -1158,6 +1463,12 @@ def win_hotkey_loop() -> None:
             update_translate_hotkey_in_thread()
         except Exception:  # noqa
             logger.exception("win_hotkey_loop: update_translate_hotkey_in_thread initial failed")
+
+        # Попробуем зарегистрировать case
+        try:
+            update_case_hotkey_in_thread()
+        except Exception:  # noqa
+            logger.exception("win_hotkey_loop: update_case_hotkey_in_thread initial failed")
 
         msg = wintypes.MSG()
         while True:
@@ -1192,11 +1503,17 @@ def win_hotkey_loop() -> None:
                         user32.UnregisterHotKey(None, HOTKEY_ID_TRANSLATE)
                     except Exception:  # noqa
                         pass
-                    # Завершим цикл
+                    try:
+                        user32.UnregisterHotKey(None, HOTKEY_ID_CASE)
+                    except Exception:  # noqa
+                        pass
                     break
                 elif hot_id == HOTKEY_ID_TRANSLATE:
                     logger.debug("win_hotkey_loop: translate hotkey pressed")
                     _translate_invoker()
+                elif hot_id == HOTKEY_ID_CASE:
+                    logger.debug("win_hotkey_loop: case hotkey pressed")
+                    _case_invoker()
                 else:
                     logger.debug("win_hotkey_loop: unknown hotkey id=%s", hot_id)
 
@@ -1212,6 +1529,18 @@ def win_hotkey_loop() -> None:
                     user32.UnregisterHotKey(None, HOTKEY_ID_TRANSLATE)
                 except Exception:  # noqa
                     logger.exception("win_hotkey_loop: UnregisterHotKey translate failed")
+            elif msg.message == MSG_REGISTER_CASE:
+                logger.debug("win_hotkey_loop: MSG_REGISTER_CASE received")
+                try:
+                    update_case_hotkey_in_thread()
+                except Exception:  # noqa
+                    logger.exception("win_hotkey_loop: update_case_hotkey_in_thread failed in handler")
+            elif msg.message == MSG_UNREGISTER_CASE:
+                logger.debug("win_hotkey_loop: MSG_UNREGISTER_CASE received")
+                try:
+                    user32.UnregisterHotKey(None, HOTKEY_ID_CASE)
+                except Exception:  # noqa
+                    logger.exception("win_hotkey_loop: UnregisterHotKey case failed")
             elif msg.message == MSG_UPDATE_EXIT_HOTKEY:
                 logger.debug("win_hotkey_loop: MSG_UPDATE_EXIT_HOTKEY received")
                 try:
@@ -1224,6 +1553,12 @@ def win_hotkey_loop() -> None:
                     update_translate_hotkey_in_thread()
                 except Exception:  # noqa
                     logger.exception("win_hotkey_loop: update_translate_hotkey_in_thread failed in handler")
+            elif msg.message == MSG_UPDATE_CASE_HOTKEY:
+                logger.debug("win_hotkey_loop: MSG_UPDATE_CASE_HOTKEY received")
+                try:
+                    update_case_hotkey_in_thread()
+                except Exception:  # noqa
+                    logger.exception("win_hotkey_loop: update_case_hotkey_in_thread failed in handler")
             else:
                 # стандартная обработка сообщений
                 user32.TranslateMessage(ctypes.byref(msg))
@@ -1241,7 +1576,10 @@ def win_hotkey_loop() -> None:
             user32.UnregisterHotKey(None, HOTKEY_ID_TRANSLATE)
         except Exception:  # noqa
             pass
-        # Установим exit_event на всякий случай
+        try:
+            user32.UnregisterHotKey(None, HOTKEY_ID_CASE)
+        except Exception:  # noqa
+            pass
         try:
             exit_event.set()
             _invoke_exit_handlers()

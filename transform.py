@@ -96,3 +96,24 @@ def transform_text_by_keyboard_layout_based_on_hkl(s: str, hkl: int) -> str:
 
     logger.debug("transform: used %s mapping", prefer)
     return "".join(out_chars)
+
+def change_case_by_logic(s: str) -> str:
+    """
+    Изменить регистр строки по правилам:
+      - если в строке нет букв — вернуть исходную строку
+      - если все буквы маленькие -> сделать ВСЕ БОЛЬШИМИ
+      - если все буквы большие -> сделать все маленькими
+      - если часть букв большая/часть маленькая -> сделать все маленькими
+
+    Возвращает новую строку (или исходную, если изменений не требуется).
+    """
+    if not s:
+        return s
+
+    letters = [ch for ch in s if ch.isalpha()]
+    if not letters:
+        return s
+
+    if all(ch.islower() for ch in letters):
+        return s.upper()
+    return s.lower()

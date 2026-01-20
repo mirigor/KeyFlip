@@ -90,6 +90,9 @@ def _ensure_defaults_in(j: dict) -> bool:
     if "translate_hotkey" not in j:
         j["translate_hotkey"] = {"modifiers": [], "key": "F4"}
         changed = True
+    if "case_hotkey" not in j:
+        j["case_hotkey"] = {"modifiers": ["CTRL", "SHIFT"], "key": "U"}
+        changed = True
     return changed
 
 
@@ -304,6 +307,43 @@ def write_translate_hotkey(modifiers: list[str], key: str) -> bool:
         return ok
     except Exception:  # noqa
         logger.exception("config: write_translate_hotkey failed")
+        return False
+
+# ---------------- Case hotkey (конфиг) ----------------
+def default_case_hotkey() -> dict:
+    """Значение по умолчанию для комбинации изменения регистра."""
+    return {"modifiers": ["CTRL", "SHIFT"], "key": "U"}
+
+
+def read_case_hotkey() -> dict:
+    """Прочитать case_hotkey из конфига — вернуть {'modifiers': [...], 'key': 'U'}"""
+    try:
+        j = read_json_config()
+        ch = j.get("case_hotkey")
+        if not isinstance(ch, dict):
+            return default_case_hotkey()
+        mods = ch.get("modifiers", []) or []
+        key = ch.get("key", "U") or "U"
+        return {"modifiers": list(mods), "key": str(key)}
+    except Exception:  # noqa
+        return default_case_hotkey()
+
+
+def write_case_hotkey(modifiers: list[str], key: str) -> bool:
+    """Нормализовать и записать case_hotkey в конфиг."""
+    try:
+        j = read_json_config()
+        j.setdefault("enabled", True)
+        j.setdefault("file_logging", False)
+        j.setdefault("autorun", False)
+        mods = _normalize_modifiers_list(modifiers)
+        j["case_hotkey"] = {"modifiers": mods, "key": str(key)}
+        ok = write_json_config(j)
+        if ok:
+            logger.info("config: записан case_hotkey=%s", j["case_hotkey"])
+        return ok
+    except Exception:  # noqa
+        logger.exception("config: write_case_hotkey failed")
         return False
 
 
