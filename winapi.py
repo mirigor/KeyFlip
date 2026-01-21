@@ -54,6 +54,8 @@ VK_SHIFT = 0x10
 VK_DELETE = 0x2E
 VK_INSERT = 0x2D
 VK_ESCAPE = 0x1B
+VK_RETURN = 0x0D
+VK_TAB = 0x09
 
 # Для регистратора сочетаний
 WH_KEYBOARD_LL = 13
@@ -88,6 +90,7 @@ VK_LMENU = 0xA4
 VK_RMENU = 0xA5
 VK_LWIN = 0x5B
 VK_RWIN = 0x5C
+
 
 # MOD masks для RegisterHotKey
 MOD_ALT = 0x0001
@@ -194,28 +197,100 @@ def send_delete() -> None:
     _key_up(VK_DELETE)
 
 
+
+def _append_vk_press(inputs: list, vk: int) -> None:
+    """Добавить в inputs нажатие виртуальной клавиши vk (down + up)."""
+    try:
+        ki_down = KEYBDINPUT(vk, 0, 0, 0, 0)
+        inputs.append(INPUT(INPUT_KEYBOARD, InputUnion(ki=ki_down)))
+        ki_up = KEYBDINPUT(vk, 0, KEYEVENTF_KEYUP, 0, 0)
+        inputs.append(INPUT(INPUT_KEYBOARD, InputUnion(ki=ki_up)))
+    except Exception:
+        pass
+
+
+def _append_shifted_enter(inputs: list) -> None:
+    """Добавить в inputs комбинацию Shift+Enter (SHIFT down, ENTER down/up, SHIFT up)."""
+    try:
+        # SHIFT down
+        ki_shift_down = KEYBDINPUT(VK_SHIFT, 0, 0, 0, 0)
+        inputs.append(INPUT(INPUT_KEYBOARD, InputUnion(ki=ki_shift_down)))
+        # ENTER down/up
+        ki_enter_down = KEYBDINPUT(VK_RETURN, 0, 0, 0, 0)
+        inputs.append(INPUT(INPUT_KEYBOARD, InputUnion(ki=ki_enter_down)))
+        ki_enter_up = KEYBDINPUT(VK_RETURN, 0, KEYEVENTF_KEYUP, 0, 0)
+        inputs.append(INPUT(INPUT_KEYBOARD, InputUnion(ki=ki_enter_up)))
+        # SHIFT up
+        ki_shift_up = KEYBDINPUT(VK_SHIFT, 0, KEYEVENTF_KEYUP, 0, 0)
+        inputs.append(INPUT(INPUT_KEYBOARD, InputUnion(ki=ki_shift_up)))
+    except Exception:
+        pass
+
+
 def send_unicode_via_sendinput(text: str, delay_between_keys: float = 0.001) -> None:
-    """Вставить текст через SendInput (UNICODE)."""
+    """
+    Вставить текст через SendInput (UNICODE), но во всех случаях заменять переносы строк
+    на Shift+Enter, чтобы избежать отправки сообщений (например в Telegram).
+    Табуляция вставляется через VK_TAB, остальные символы — через KEYEVENTF_UNICODE.
+    """
     if not text:
         return
-    inputs: list[INPUT] = []
-    for ch in text:
-        code = ord(ch)
-        ki_down = KEYBDINPUT(0, code, KEYEVENTF_UNICODE, 0, 0)
-        inp_down = INPUT(INPUT_KEYBOARD, InputUnion(ki=ki_down))
-        inputs.append(inp_down)
-        ki_up = KEYBDINPUT(0, code, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP, 0, 0)
-        inp_up = INPUT(INPUT_KEYBOARD, InputUnion(ki=ki_up))
-        inputs.append(inp_up)
-    n = len(inputs)
-    arr_type = INPUT * n
-    arr = arr_type(*inputs)
-    p = ctypes.pointer(arr[0])
-    sent = SendInput(n, p, ctypes.sizeof(INPUT))
-    if sent != n:
-        logger.warning("send_unicode_via_sendinput: SendInput sent %d of %d events", sent, n)
-    if delay_between_keys > 0:
-        time.sleep(delay_between_keys)
+    try:
+        inputs: list[INPUT] = []
+        i = 0
+        L = len(text)
+        used_shift_enter = False
+        while i < L:
+            ch = text[i]
+            # Обработка CRLF / CR / LF -> всегда SHIFT+ENTER
+            if ch == '\r' or ch == '\n':
+                # если последовательность CRLF — пропускаем второй символ
+                if ch == '\r' and i + 1 < L and text[i + 1] == '\n':
+                    i += 1  # пропустить LF, обработаем Enter один раз
+                _append_shifted_enter(inputs)
+                used_shift_enter = True
+                i += 1
+                continue
+
+            # Табуляция -> VK_TAB
+            if ch == '\t':
+                _append_vk_press(inputs, VK_TAB)
+                i += 1
+                continue
+
+            # По-умолчанию — Unicode-символ через KEYEVENTF_UNICODE
+            code = ord(ch)
+            try:
+                ki_down = KEYBDINPUT(0, code, KEYEVENTF_UNICODE, 0, 0)
+                inputs.append(INPUT(INPUT_KEYBOARD, InputUnion(ki=ki_down)))
+                ki_up = KEYBDINPUT(0, code, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP, 0, 0)
+                inputs.append(INPUT(INPUT_KEYBOARD, InputUnion(ki=ki_up)))
+            except Exception:
+                # fallback: постим WM_CHAR в окно (в редких случаях)
+                try:
+                    hwnd_fore = user32.GetForegroundWindow()
+                    if hwnd_fore:
+                        user32.PostMessageW(hwnd_fore, win32con.WM_CHAR, code, 0)
+                except Exception:
+                    pass
+            i += 1
+
+        # отправляем пакет
+        n = len(inputs)
+        if n == 0:
+            return
+        arr_type = INPUT * n
+        arr = arr_type(*inputs)
+        p = ctypes.pointer(arr[0])
+        sent = SendInput(n, p, ctypes.sizeof(INPUT))
+        if sent != n:
+            logger.warning("send_unicode_via_sendinput: SendInput sent %d of %d events", sent, n)
+        if used_shift_enter:
+            logger.debug("send_unicode_via_sendinput: использован Shift+Enter для переносов строк")
+        if delay_between_keys > 0:
+            time.sleep(delay_between_keys)
+    except Exception:  # noqa
+        logger.exception("send_unicode_via_sendinput: exception")
 
 
 # ---------------- Active window info ----------------
