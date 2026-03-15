@@ -17,7 +17,7 @@
 
 1. Установи зависимости:
    ```bash
-   pip install pyperclip pillow pystray psutil pywin32 comtypes
+   pip install pyperclip pillow pystray psutil pywin32
    ```
 
 2. Запусти **app.pyw** в папке проекта

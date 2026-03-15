@@ -25,13 +25,16 @@ try:
     from PIL import Image, ImageDraw
     from pystray import Menu, MenuItem, Icon
     import psutil
-    import win32event, win32api, win32con
+    import win32event
+    import win32api
+    import win32con
 except Exception:  # noqa
     print(
         "❌ Требуются библиотеки: pyperclip, Pillow, pystray, psutil, pywin32\n"
         "Установи командой:\n"
         "   pip install pyperclip pillow pystray psutil pywin32"
     )
+
 
 def check_dependencies() -> None:
     """Проверяем все необходимые пакеты. Если чего-то нет — сразу говорим и выходим."""
@@ -44,8 +47,7 @@ def check_dependencies() -> None:
         "pystray": "pystray",
         "psutil": "psutil",
         "win32api": "pywin32",
-        "comtypes": "comtypes",          # для UIA (выделение без мигания)
-        "win32com": "pywin32",           # для автозапуска
+        "win32com": "pywin32",
     }
 
     for module_name, pip_name in required.items():
