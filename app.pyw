@@ -12,7 +12,8 @@
 import sys
 import threading
 import time
-from typing import Optional, Tuple
+from tkinter import messagebox, Tk
+from typing import Optional
 
 from config import APP_NAME, MUTEX_NAME, load_config, apply_autorun_setting
 from logging_setup import logger
@@ -31,7 +32,46 @@ except Exception:  # noqa
         "Установи командой:\n"
         "   pip install pyperclip pillow pystray psutil pywin32"
     )
-    raise
+
+def check_dependencies() -> None:
+    """Проверяем все необходимые пакеты. Если чего-то нет — сразу говорим и выходим."""
+
+    missing = []
+
+    required = {
+        "pyperclip": "pyperclip",
+        "PIL": "pillow",
+        "pystray": "pystray",
+        "psutil": "psutil",
+        "win32api": "pywin32",
+        "comtypes": "comtypes",          # для UIA (выделение без мигания)
+        "win32com": "pywin32",           # для автозапуска
+    }
+
+    for module_name, pip_name in required.items():
+        try:
+            __import__(module_name)
+        except ImportError:
+            missing.append(pip_name)
+
+    if not missing:
+        return
+
+    title = "KeyFlip — ошибка зависимостей"
+    msg = (
+        f"❌ KeyFlip не может запуститься — отсутствуют библиотеки:\n\n"
+        f"{' '.join(missing)}\n\n"
+        f"Установи одной командой:\n"
+        f"pip install {' '.join(missing)}\n\n"
+        f"После установки перезапусти приложение."
+    )
+    root = Tk()
+    root.withdraw()  # скрываем главное окно
+    messagebox.showerror(title, msg)
+    root.destroy()
+    sys.exit(1)
+
+
 
 # Код ошибки, когда mutex уже существует (Windows)
 ERROR_ALREADY_EXISTS = 183
@@ -88,7 +128,7 @@ def _release_mutex(mutex_handle: Optional[int]) -> None:
         logger.exception("_release_mutex: unexpected exception")
 
 
-def _start_worker_threads() -> Tuple[threading.Thread, threading.Thread]:
+def _start_worker_threads() -> tuple[threading.Thread, threading.Thread]:
     """
     Запустить два daemon-потока:
     - WinHotkeyThread: loop для обработки WM_HOTKEY и внутренних сообщений
@@ -167,4 +207,5 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    check_dependencies()
     main()
