@@ -17,7 +17,13 @@
 
 1. Установи зависимости:
    ```bash
-   pip install pyperclip pillow pystray psutil pywin32
+   pip install -r requirements.txt
    ```
 
 2. Запусти **app.pyw** в папке проекта
+
+## Тесты
+
+```bash
+.venv\Scripts\python.exe -m unittest discover -v
+```

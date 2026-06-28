@@ -4,7 +4,9 @@
 Здесь — только чистая бизнес-логика (без побочных эффектов).
 """
 
-from logging_setup import logger
+import logging
+
+logger = logging.getLogger("KeyFlip")
 
 # ---------------- Таблицы соответствий раскладок ----------------
 EN_TO_RU: dict[str, str] = {
@@ -79,7 +81,7 @@ def transform_text_by_keyboard_layout_based_on_hkl(s: str, hkl: int) -> str:
     Возвращает:
         преобразованную строку
     """
-    mapping, reverse, prefer = _select_mappings_by_hkl(hkl)
+    mapping, _reverse, prefer = _select_mappings_by_hkl(hkl)
 
     out_chars: list[str] = []
     for ch in s:
@@ -88,14 +90,15 @@ def transform_text_by_keyboard_layout_based_on_hkl(s: str, hkl: int) -> str:
             out_chars.append(mapping[ch])
             continue
         # затем пробуем обратную (поддержка случаев двойной путаницы раскладки)
-        if ch in reverse:
-            out_chars.append(reverse[ch])
+        if ch in _reverse:
+            out_chars.append(_reverse[ch])
             continue
         # иначе — оставляем символ как есть
         out_chars.append(ch)
 
     logger.debug("transform: used %s mapping", prefer)
     return "".join(out_chars)
+
 
 def change_case_by_logic(s: str) -> str:
     """

@@ -39,6 +39,7 @@ from transform import transform_text_by_keyboard_layout_based_on_hkl, change_cas
 # ---------------- ctypes helpers ----------------
 user32 = ctypes.windll.user32
 kernel32 = ctypes.windll.kernel32
+gdi32 = ctypes.windll.gdi32
 
 ULONG_PTR = wintypes.WPARAM  # alias для совместимости
 
@@ -98,6 +99,17 @@ MOD_CONTROL = 0x0002
 MOD_SHIFT = 0x0004
 MOD_WIN = 0x0008
 
+# Clipboard formats / memory flags
+CF_BITMAP = 2
+CF_ENHMETAFILE = 14
+GMEM_MOVEABLE = 0x0002
+IMAGE_BITMAP = 0
+LR_CREATEDIBSECTION = 0x00002000
+WS_POPUP = 0x80000000
+MAX_CLIPBOARD_SNAPSHOT_FORMATS = 15
+
+ClipboardPayload = tuple[int, str, object]
+
 
 # ---------------- SendInput structures ----------------
 class KEYBDINPUT(ctypes.Structure):
@@ -122,6 +134,98 @@ class INPUT(ctypes.Structure):
 SendInput = user32.SendInput
 SendInput.argtypes = (wintypes.UINT, ctypes.POINTER(INPUT), ctypes.c_int)
 SendInput.restype = wintypes.UINT
+
+user32.OpenClipboard.argtypes = (wintypes.HWND,)
+user32.OpenClipboard.restype = wintypes.BOOL
+user32.CloseClipboard.argtypes = ()
+user32.CloseClipboard.restype = wintypes.BOOL
+user32.EmptyClipboard.argtypes = ()
+user32.EmptyClipboard.restype = wintypes.BOOL
+user32.EnumClipboardFormats.argtypes = (wintypes.UINT,)
+user32.EnumClipboardFormats.restype = wintypes.UINT
+user32.GetClipboardData.argtypes = (wintypes.UINT,)
+user32.GetClipboardData.restype = wintypes.HANDLE
+user32.SetClipboardData.argtypes = (wintypes.UINT, wintypes.HANDLE)
+user32.SetClipboardData.restype = wintypes.HANDLE
+user32.CopyImage.argtypes = (wintypes.HANDLE, wintypes.UINT, ctypes.c_int, ctypes.c_int, wintypes.UINT)
+user32.CopyImage.restype = wintypes.HANDLE
+user32.CreateWindowExW.argtypes = (
+    wintypes.DWORD,
+    wintypes.LPCWSTR,
+    wintypes.LPCWSTR,
+    wintypes.DWORD,
+    ctypes.c_int,
+    ctypes.c_int,
+    ctypes.c_int,
+    ctypes.c_int,
+    wintypes.HWND,
+    wintypes.HMENU,
+    wintypes.HINSTANCE,
+    wintypes.LPVOID,
+)
+user32.CreateWindowExW.restype = wintypes.HWND
+user32.DestroyWindow.argtypes = (wintypes.HWND,)
+user32.DestroyWindow.restype = wintypes.BOOL
+user32.GetForegroundWindow.argtypes = ()
+user32.GetForegroundWindow.restype = wintypes.HWND
+user32.GetWindowTextLengthW.argtypes = (wintypes.HWND,)
+user32.GetWindowTextLengthW.restype = ctypes.c_int
+user32.GetWindowTextW.argtypes = (wintypes.HWND, wintypes.LPWSTR, ctypes.c_int)
+user32.GetWindowTextW.restype = ctypes.c_int
+user32.GetWindowThreadProcessId.argtypes = (wintypes.HWND, ctypes.POINTER(wintypes.DWORD))
+user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+user32.GetKeyboardLayout.argtypes = (wintypes.DWORD,)
+user32.GetKeyboardLayout.restype = wintypes.HANDLE
+user32.LoadKeyboardLayoutW.argtypes = (wintypes.LPCWSTR, wintypes.UINT)
+user32.LoadKeyboardLayoutW.restype = wintypes.HANDLE
+user32.ActivateKeyboardLayout.argtypes = (wintypes.HANDLE, wintypes.UINT)
+user32.ActivateKeyboardLayout.restype = wintypes.HANDLE
+user32.PostMessageW.argtypes = (wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM)
+user32.PostMessageW.restype = wintypes.BOOL
+user32.PostThreadMessageW.argtypes = (wintypes.DWORD, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM)
+user32.PostThreadMessageW.restype = wintypes.BOOL
+user32.RegisterHotKey.argtypes = (wintypes.HWND, ctypes.c_int, wintypes.UINT, wintypes.UINT)
+user32.RegisterHotKey.restype = wintypes.BOOL
+user32.UnregisterHotKey.argtypes = (wintypes.HWND, ctypes.c_int)
+user32.UnregisterHotKey.restype = wintypes.BOOL
+user32.GetMessageW.argtypes = (ctypes.POINTER(wintypes.MSG), wintypes.HWND, wintypes.UINT, wintypes.UINT)
+user32.GetMessageW.restype = ctypes.c_int
+user32.PeekMessageW.argtypes = (ctypes.POINTER(wintypes.MSG), wintypes.HWND, wintypes.UINT, wintypes.UINT, wintypes.UINT)
+user32.PeekMessageW.restype = wintypes.BOOL
+user32.TranslateMessage.argtypes = (ctypes.POINTER(wintypes.MSG),)
+user32.TranslateMessage.restype = wintypes.BOOL
+user32.DispatchMessageW.argtypes = (ctypes.POINTER(wintypes.MSG),)
+user32.DispatchMessageW.restype = wintypes.LPARAM
+user32.GetAsyncKeyState.argtypes = (ctypes.c_int,)
+user32.GetAsyncKeyState.restype = wintypes.SHORT
+user32.GetClipboardSequenceNumber.argtypes = ()
+user32.GetClipboardSequenceNumber.restype = wintypes.DWORD
+user32.keybd_event.argtypes = (wintypes.BYTE, wintypes.BYTE, wintypes.DWORD, ULONG_PTR)
+user32.keybd_event.restype = None
+
+kernel32.GlobalAlloc.argtypes = (wintypes.UINT, ctypes.c_size_t)
+kernel32.GlobalAlloc.restype = wintypes.HGLOBAL
+kernel32.GlobalFree.argtypes = (wintypes.HGLOBAL,)
+kernel32.GlobalFree.restype = wintypes.HGLOBAL
+kernel32.GlobalLock.argtypes = (wintypes.HGLOBAL,)
+kernel32.GlobalLock.restype = ctypes.c_void_p
+kernel32.GlobalUnlock.argtypes = (wintypes.HGLOBAL,)
+kernel32.GlobalUnlock.restype = wintypes.BOOL
+kernel32.GlobalSize.argtypes = (wintypes.HGLOBAL,)
+kernel32.GlobalSize.restype = ctypes.c_size_t
+kernel32.GetModuleHandleW.argtypes = (wintypes.LPCWSTR,)
+kernel32.GetModuleHandleW.restype = wintypes.HMODULE
+kernel32.GetCurrentThreadId.argtypes = ()
+kernel32.GetCurrentThreadId.restype = wintypes.DWORD
+kernel32.GetLastError.argtypes = ()
+kernel32.GetLastError.restype = wintypes.DWORD
+
+gdi32.DeleteObject.argtypes = (wintypes.HGDIOBJ,)
+gdi32.DeleteObject.restype = wintypes.BOOL
+gdi32.CopyEnhMetaFileW.argtypes = (wintypes.HANDLE, wintypes.LPCWSTR)
+gdi32.CopyEnhMetaFileW.restype = wintypes.HANDLE
+gdi32.DeleteEnhMetaFile.argtypes = (wintypes.HANDLE,)
+gdi32.DeleteEnhMetaFile.restype = wintypes.BOOL
 
 # ---------------- VK map for readable names ----------------
 VK_MAP = {
@@ -227,14 +331,25 @@ def _append_shifted_enter(inputs: list) -> None:
         pass
 
 
-def send_unicode_via_sendinput(text: str, delay_between_keys: float = 0.001) -> None:
+def _append_unicode_code_unit(inputs: list, code_unit: int) -> None:
+    """Добавить UTF-16 code unit для SendInput KEYEVENTF_UNICODE."""
+    try:
+        ki_down = KEYBDINPUT(0, code_unit, KEYEVENTF_UNICODE, 0, 0)
+        inputs.append(INPUT(INPUT_KEYBOARD, InputUnion(ki=ki_down)))
+        ki_up = KEYBDINPUT(0, code_unit, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP, 0, 0)
+        inputs.append(INPUT(INPUT_KEYBOARD, InputUnion(ki=ki_up)))
+    except Exception:
+        pass
+
+
+def send_unicode_via_sendinput(text: str, delay_between_keys: float = 0.001) -> bool:
     """
     Вставить текст через SendInput (UNICODE), но во всех случаях заменять переносы строк
     на Shift+Enter, чтобы избежать отправки сообщений (например в Telegram).
     Табуляция вставляется через VK_TAB, остальные символы — через KEYEVENTF_UNICODE.
     """
     if not text:
-        return
+        return True
     try:
         inputs: list[INPUT] = []
         i = 0
@@ -258,39 +373,36 @@ def send_unicode_via_sendinput(text: str, delay_between_keys: float = 0.001) -> 
                 i += 1
                 continue
 
-            # По-умолчанию — Unicode-символ через KEYEVENTF_UNICODE
-            code = ord(ch)
-            try:
-                ki_down = KEYBDINPUT(0, code, KEYEVENTF_UNICODE, 0, 0)
-                inputs.append(INPUT(INPUT_KEYBOARD, InputUnion(ki=ki_down)))
-                ki_up = KEYBDINPUT(0, code, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP, 0, 0)
-                inputs.append(INPUT(INPUT_KEYBOARD, InputUnion(ki=ki_up)))
-            except Exception:
-                # fallback: постим WM_CHAR в окно (в редких случаях)
-                try:
-                    hwnd_fore = user32.GetForegroundWindow()
-                    if hwnd_fore:
-                        user32.PostMessageW(hwnd_fore, win32con.WM_CHAR, code, 0)
-                except Exception:
-                    pass
+            # По-умолчанию — Unicode-символ через KEYEVENTF_UNICODE.
+            # Windows принимает UTF-16 code units, поэтому символы вне BMP
+            # отправляем суррогатной парой, а не усеченным Python code point.
+            encoded = ch.encode("utf-16-le", "surrogatepass")
+            for j in range(0, len(encoded), 2):
+                code_unit = int.from_bytes(encoded[j:j + 2], "little")
+                _append_unicode_code_unit(inputs, code_unit)
             i += 1
 
         # отправляем пакет
         n = len(inputs)
         if n == 0:
-            return
+            return True
         arr_type = INPUT * n
         arr = arr_type(*inputs)
         p = ctypes.pointer(arr[0])
         sent = SendInput(n, p, ctypes.sizeof(INPUT))
+        if sent == 0:
+            logger.warning("send_unicode_via_sendinput: SendInput sent 0 of %d events", n)
+            return False
         if sent != n:
             logger.warning("send_unicode_via_sendinput: SendInput sent %d of %d events", sent, n)
         if used_shift_enter:
             logger.debug("send_unicode_via_sendinput: использован Shift+Enter для переносов строк")
         if delay_between_keys > 0:
             time.sleep(delay_between_keys)
+        return True
     except Exception:  # noqa
         logger.exception("send_unicode_via_sendinput: exception")
+        return False
 
 
 # ---------------- Active window info ----------------
@@ -314,7 +426,7 @@ def get_active_window_info() -> tuple[str, int, str | None]:
     pid = 0
     proc_name: str | None = None
     try:
-        pid_c = ctypes.c_ulong()
+        pid_c = wintypes.DWORD()
         user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid_c))
         pid = int(pid_c.value)
         if psutil:
@@ -467,10 +579,8 @@ def safe_copy_from_selection(timeout_per_attempt: float = 0.6, max_attempts: int
                         last_exception = e
 
                 logger.debug("safe_copy: no clipboard change after attempt %d", attempt)
-                break
 
-            logger.debug("safe_copy: sequence not changed -> no selection")
-            return "", pressed_vks
+            logger.debug("safe_copy: sequence not changed -> trying sentinel fallback")
 
         # ---- fallback sentinel approach ----
         if foreground_changed():
@@ -550,25 +660,254 @@ def safe_copy_from_selection(timeout_per_attempt: float = 0.6, max_attempts: int
         logger.debug("safe_copy: returning with pressed_vks=%r", pressed_vks)
 
 
-# ---------------- Restore modifiers ----------------
-def _restore_modifiers_from_vks(vks: set[int]) -> None:
-    """
-    Восстановить логические модификаторы, нажав соответствующие left-side VK.
-    """
+# ---------------- Clipboard / modifier restore helpers ----------------
+def _create_clipboard_owner_window(context: str):
+    """Создать временное скрытое окно-владелец для записи в clipboard."""
     try:
-        to_press: set[int] = set()
-        for vk in vks:
-            if vk in (VK_LCONTROL, VK_RCONTROL):
-                to_press.add(VK_LCONTROL)
-            elif vk in (VK_LMENU, VK_RMENU):
-                to_press.add(VK_LMENU)
-            elif vk in (VK_LSHIFT, VK_RSHIFT):
-                to_press.add(VK_LSHIFT)
-            elif vk in (VK_LWIN, VK_RWIN):
-                to_press.add(VK_LWIN)
-        for vk in to_press:
+        hinst = kernel32.GetModuleHandleW(None)
+        hwnd = user32.CreateWindowExW(
+            0,
+            "STATIC",
+            "KeyFlipClipboardOwner",
+            WS_POPUP,
+            0,
+            0,
+            0,
+            0,
+            None,
+            None,
+            hinst,
+            None,
+        )
+        if not hwnd:
+            logger.debug("%s: CreateWindowExW for clipboard owner failed", context)
+        return hwnd
+    except Exception as e:  # noqa
+        logger.debug("%s: CreateWindowExW exception: %s", context, e)
+        return None
+
+
+def _open_clipboard_with_retry(context: str, owner=None, attempts: int = 8, delay: float = 0.025) -> bool:
+    """Открыть clipboard с короткими повторами: он часто бывает занят чужим процессом."""
+    for _ in range(attempts):
+        try:
+            if user32.OpenClipboard(owner):
+                return True
+        except Exception as e:  # noqa
+            logger.debug("%s: OpenClipboard exception: %s", context, e)
+        time.sleep(delay)
+    logger.debug("%s: OpenClipboard failed after retries", context)
+    return False
+
+
+def _clipboard_hglobal_to_bytes(handle) -> bytes | None:
+    """Скопировать HGLOBAL clipboard-данные в bytes."""
+    try:
+        size = int(kernel32.GlobalSize(handle))
+        if size <= 0:
+            return None
+        ptr = kernel32.GlobalLock(handle)
+        if not ptr:
+            return None
+        try:
+            return ctypes.string_at(ptr, size)
+        finally:
+            kernel32.GlobalUnlock(handle)
+    except Exception:  # noqa
+        return None
+
+
+def _bytes_to_clipboard_hglobal(data: bytes):
+    """Создать новый HGLOBAL для SetClipboardData; ownership перейдет Windows при успехе."""
+    hmem = None
+    try:
+        hmem = kernel32.GlobalAlloc(GMEM_MOVEABLE, len(data))
+        if not hmem:
+            return None
+        ptr = kernel32.GlobalLock(hmem)
+        if not ptr:
+            kernel32.GlobalFree(hmem)
+            return None
+        try:
+            ctypes.memmove(ptr, data, len(data))
+        finally:
+            kernel32.GlobalUnlock(hmem)
+        return hmem
+    except Exception:  # noqa
+        try:
+            if hmem:
+                kernel32.GlobalFree(hmem)
+        except Exception:  # noqa
+            pass
+        return None
+
+
+def _free_clipboard_payload(payload: ClipboardPayload) -> None:
+    """Освободить локальную копию clipboard-данных, если она не была передана Windows."""
+    fmt, kind, value = payload
+    try:
+        if kind == "bitmap":
+            gdi32.DeleteObject(value)
+        elif kind == "enhmetafile":
+            gdi32.DeleteEnhMetaFile(value)
+    except Exception:  # noqa
+        logger.debug("clipboard: failed to free payload fmt=%s kind=%s", fmt, kind)
+
+
+def _save_clipboard_for_restore(context: str) -> tuple[bool, list[ClipboardPayload]]:
+    """Сохранить snapshot clipboard-форматов перед служебным Ctrl+C."""
+    snapshot: list[ClipboardPayload] = []
+    saw_format = False
+    if not _open_clipboard_with_retry(context):
+        return False, snapshot
+
+    try:
+        fmt = 0
+        while True:
+            fmt = int(user32.EnumClipboardFormats(fmt))
+            if fmt == 0:
+                break
+            if len(snapshot) >= MAX_CLIPBOARD_SNAPSHOT_FORMATS:
+                logger.debug(
+                    "%s: clipboard snapshot format limit reached (%d)",
+                    context,
+                    MAX_CLIPBOARD_SNAPSHOT_FORMATS,
+                )
+                break
+            saw_format = True
+            handle = user32.GetClipboardData(fmt)
+            if not handle:
+                continue
+
+            if fmt == CF_BITMAP:
+                copied = user32.CopyImage(handle, IMAGE_BITMAP, 0, 0, LR_CREATEDIBSECTION)
+                if copied:
+                    snapshot.append((fmt, "bitmap", copied))
+                continue
+
+            if fmt == CF_ENHMETAFILE:
+                copied = gdi32.CopyEnhMetaFileW(handle, None)
+                if copied:
+                    snapshot.append((fmt, "enhmetafile", copied))
+                continue
+
+            data = _clipboard_hglobal_to_bytes(handle)
+            if data is not None:
+                snapshot.append((fmt, "hglobal", data))
+
+        if saw_format and not snapshot:
+            logger.debug("%s: clipboard had formats, but none were safely copied", context)
+            return False, snapshot
+
+        logger.debug("%s: saved clipboard snapshot formats=%d", context, len(snapshot))
+        return True, snapshot
+    except Exception as e:  # noqa
+        logger.debug("%s: cannot save clipboard snapshot: %s", context, e)
+        for payload in snapshot:
+            _free_clipboard_payload(payload)
+        return False, []
+    finally:
+        try:
+            user32.CloseClipboard()
+        except Exception:  # noqa
+            pass
+
+
+def _restore_clipboard_snapshot(
+    saved_ok: bool,
+    snapshot: list[ClipboardPayload],
+    context: str,
+    delay: float = 0.05,
+) -> None:
+    """Восстановить clipboard snapshot после служебного копирования."""
+    if not saved_ok:
+        return
+    if delay > 0:
+        time.sleep(delay)
+    owner_hwnd = _create_clipboard_owner_window(context)
+    if not owner_hwnd:
+        for payload in snapshot:
+            _free_clipboard_payload(payload)
+        return
+
+    if not _open_clipboard_with_retry(context, owner=owner_hwnd):
+        try:
+            user32.DestroyWindow(owner_hwnd)
+        except Exception:  # noqa
+            pass
+        for payload in snapshot:
+            _free_clipboard_payload(payload)
+        return
+
+    transferred_payloads: set[int] = set()
+    try:
+        user32.EmptyClipboard()
+        restored = 0
+        for payload in snapshot:
+            fmt, kind, value = payload
+            handle = None
+            if kind == "hglobal":
+                handle = _bytes_to_clipboard_hglobal(value)  # type: ignore[arg-type]
+            elif kind in ("bitmap", "enhmetafile"):
+                handle = value
+
+            if not handle:
+                _free_clipboard_payload(payload)
+                continue
+
+            if user32.SetClipboardData(fmt, handle):
+                transferred_payloads.add(id(payload))
+                restored += 1
+            else:
+                if kind == "hglobal":
+                    try:
+                        kernel32.GlobalFree(handle)
+                    except Exception:  # noqa
+                        pass
+                else:
+                    _free_clipboard_payload(payload)
+
+        logger.debug("%s: restored clipboard snapshot formats=%d", context, restored)
+    except Exception as e:  # noqa
+        logger.debug("%s: cannot restore clipboard snapshot: %s", context, e)
+        for payload in snapshot:
+            if id(payload) not in transferred_payloads:
+                _free_clipboard_payload(payload)
+    finally:
+        try:
+            user32.CloseClipboard()
+        except Exception:  # noqa
+            pass
+        try:
+            if owner_hwnd:
+                user32.DestroyWindow(owner_hwnd)
+        except Exception:  # noqa
+            pass
+
+
+def _release_modifiers_after_hotkey(vks: set[int]) -> None:
+    """Отпустить модификаторы после хоткея, чтобы не оставлять синтетически зажатый Ctrl/Shift."""
+    release_order = (
+        VK_CONTROL,
+        VK_SHIFT,
+        VK_MENU,
+        VK_LCONTROL,
+        VK_RCONTROL,
+        VK_LSHIFT,
+        VK_RSHIFT,
+        VK_LMENU,
+        VK_RMENU,
+        VK_LWIN,
+        VK_RWIN,
+    )
+    try:
+        to_release = set(vks or set())
+        to_release.update(release_order)
+        for vk in release_order:
+            if vk not in to_release:
+                continue
             try:
-                _key_down(vk)
+                _key_up(vk)
             except Exception:  # noqa
                 pass
     except Exception:  # noqa
@@ -612,26 +951,21 @@ def handle_hotkey_transform() -> None:
     """Прочитать выделение, преобразовать раскладку и вставить обратно."""
     logger.info("Translate обработка — начинаю преобразование выделения")
     pressed_vks: set[int] = set()
+    saved_clipboard_ok = False
+    saved_clipboard_snapshot: list[ClipboardPayload] = []
+    clipboard_restore_delay = 0.05
     try:
         if not is_enabled():
             logger.debug("handle: disabled, returning")
             return
         title, pid, proc_name = get_active_window_info()
         logger.info("handle: active window: %r pid=%s proc=%r", title, pid, proc_name)
-        try:
-            try:
-                saved = pyperclip.paste()
-            except Exception:  # noqa
-                saved = None
-            logger.debug("handle: прочитал (но не буду восстанавливать) буфер text-len=%s",
-                         None if saved is None else len(saved))
-        except Exception:  # noqa
-            pass
+        saved_clipboard_ok, saved_clipboard_snapshot = _save_clipboard_for_restore("handle")
 
         hwnd = None
         try:
             hwnd = user32.GetForegroundWindow()
-            pid_c = ctypes.c_ulong()
+            pid_c = wintypes.DWORD()
             thread_id = user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid_c))
             hkl = user32.GetKeyboardLayout(thread_id) & 0xFFFF
             logger.debug("handle: foreground thread hkl=0x%04X", hkl)
@@ -667,13 +1001,8 @@ def handle_hotkey_transform() -> None:
             return
 
         try:
-            send_delete()
-            time.sleep(0.02)
-        except Exception as e:  # noqa
-            logger.exception("handle: delete exception: %s", e)
-
-        try:
-            send_unicode_via_sendinput(converted, delay_between_keys=0.001)
+            if not send_unicode_via_sendinput(converted, delay_between_keys=0.001):
+                raise RuntimeError("SendInput did not send unicode text")
             logger.debug("handle: вставил через SendInput (unicode) — без использования clipboard")
         except Exception as e:  # noqa
             logger.exception("handle: send_unicode_via_sendinput failed: %s", e)
@@ -681,6 +1010,7 @@ def handle_hotkey_transform() -> None:
                 pyperclip.copy(converted)
                 time.sleep(0.02)
                 send_ctrl_v()
+                clipboard_restore_delay = 0.2
                 logger.debug("handle: fallback: вставил через буфер (ctrl+v)")
             except Exception as e2:  # noqa
                 logger.exception("handle: fallback paste failed: %s", e2)
@@ -693,7 +1023,7 @@ def handle_hotkey_transform() -> None:
                     new_klid = "00000419"
                 hkl_new = user32.LoadKeyboardLayoutW(new_klid, 1)
                 WM_INPUTLANGCHANGEREQUEST = 0x0050
-                res_post = user32.PostMessageW(hwnd, WM_INPUTLANGCHANGEREQUEST, 0, ctypes.c_void_p(hkl_new))
+                res_post = user32.PostMessageW(hwnd, WM_INPUTLANGCHANGEREQUEST, 0, int(hkl_new))
                 if res_post == 0:
                     logger.debug("handle: PostMessageW failed (res=0), falling back to ActivateKeyboardLayout")
                     try:
@@ -711,11 +1041,19 @@ def handle_hotkey_transform() -> None:
         logger.exception("handle_hotkey_transform: исключение при обработке: %s", e)
     finally:
         try:
-            if pressed_vks:
-                logger.debug("handle: restoring previously released modifiers vks=%r", pressed_vks)
-                _restore_modifiers_from_vks(pressed_vks)
+            _restore_clipboard_snapshot(
+                saved_clipboard_ok,
+                saved_clipboard_snapshot,
+                "handle",
+                delay=clipboard_restore_delay,
+            )
         except Exception:  # noqa
-            logger.exception("handle: failed to restore modifiers")
+            logger.exception("handle: failed to restore clipboard")
+        try:
+            logger.debug("handle: releasing modifiers after hotkey vks=%r", pressed_vks)
+            _release_modifiers_after_hotkey(pressed_vks)
+        except Exception:  # noqa
+            logger.exception("handle: failed to release modifiers")
 
 
 # ---------------- Case handler (debounce + worker) ----------------
@@ -750,21 +1088,16 @@ def handle_hotkey_case() -> None:
     """Прочитать выделение, изменить регистр и вставить обратно."""
     logger.info("Case обработка — начинаю изменение регистра выделения")
     pressed_vks: set[int] = set()
+    saved_clipboard_ok = False
+    saved_clipboard_snapshot: list[ClipboardPayload] = []
+    clipboard_restore_delay = 0.05
     try:
         if not is_enabled():
             logger.debug("handle_case: disabled, returning")
             return
         title, pid, proc_name = get_active_window_info()
         logger.info("handle_case: active window: %r pid=%s proc=%r", title, pid, proc_name)
-        try:
-            try:
-                saved = pyperclip.paste()
-            except Exception:  # noqa
-                saved = None
-            logger.debug("handle_case: прочитал (но не буду восстанавливать) буфер text-len=%s",
-                         None if saved is None else len(saved))
-        except Exception:  # noqa
-            pass
+        saved_clipboard_ok, saved_clipboard_snapshot = _save_clipboard_for_restore("handle_case")
 
         res = safe_copy_from_selection(timeout_per_attempt=0.6, max_attempts=2)
         if isinstance(res, tuple):
@@ -792,13 +1125,8 @@ def handle_hotkey_case() -> None:
             return
 
         try:
-            send_delete()
-            time.sleep(0.02)
-        except Exception as e:  # noqa
-            logger.exception("handle_case: delete exception: %s", e)
-
-        try:
-            send_unicode_via_sendinput(converted, delay_between_keys=0.001)
+            if not send_unicode_via_sendinput(converted, delay_between_keys=0.001):
+                raise RuntimeError("SendInput did not send unicode text")
             logger.debug("handle_case: вставил через SendInput (unicode)")
         except Exception as e:  # noqa
             logger.exception("handle_case: send_unicode_via_sendinput failed: %s", e)
@@ -806,6 +1134,7 @@ def handle_hotkey_case() -> None:
                 pyperclip.copy(converted)
                 time.sleep(0.02)
                 send_ctrl_v()
+                clipboard_restore_delay = 0.2
                 logger.debug("handle_case: fallback: вставил через буфер (ctrl+v)")
             except Exception as e2:  # noqa
                 logger.exception("handle_case: fallback paste failed: %s", e2)
@@ -815,11 +1144,19 @@ def handle_hotkey_case() -> None:
         logger.exception("handle_hotkey_case: исключение при обработке: %s", e)
     finally:
         try:
-            if pressed_vks:
-                logger.debug("handle_case: restoring previously released modifiers vks=%r", pressed_vks)
-                _restore_modifiers_from_vks(pressed_vks)
+            _restore_clipboard_snapshot(
+                saved_clipboard_ok,
+                saved_clipboard_snapshot,
+                "handle_case",
+                delay=clipboard_restore_delay,
+            )
         except Exception:  # noqa
-            logger.exception("handle_case: failed to restore modifiers")
+            logger.exception("handle_case: failed to restore clipboard")
+        try:
+            logger.debug("handle_case: releasing modifiers after hotkey vks=%r", pressed_vks)
+            _release_modifiers_after_hotkey(pressed_vks)
+        except Exception:  # noqa
+            logger.exception("handle_case: failed to release modifiers")
 
 
 # ---------------- Hotkey messaging helpers ----------------
@@ -888,7 +1225,7 @@ def post_update_translate_hotkey() -> bool:
 
 
 def post_register_case(should_register: bool) -> bool:
-    """Послать потоковое сообщение для регистрации/отмены комбинации перевода."""
+    """Послать потоковое сообщение для регистрации/отмены комбинации регистра."""
     global HOTKEY_THREAD_ID
     if not _post_thread_message_check_thread():
         return False
@@ -941,7 +1278,10 @@ def key_name_to_vk(name: str) -> int:
             return ord(ch)
     try:
         if n.startswith("VK_"):
-            return int(getattr(win32con, n, 0))
+            known_vk = int(getattr(win32con, n, 0))
+            if known_vk:
+                return known_vk
+            return int(n[3:], 16)
     except Exception:  # noqa
         pass
     return VK_MAP.get("F10", 0x79)
@@ -1135,14 +1475,18 @@ def update_case_hotkey_in_thread() -> None:
         key = ch.get("key", "U") or "U"
         mask, vk = hotkey_tuple_from_config(mods, key)
 
+        if not is_enabled():
+            logger.debug("update_case_hotkey_in_thread: приложение выключено, пропускаю регистрацию case")
+            return
+
         th = read_translate_hotkey()
         th_mask, th_vk = hotkey_tuple_from_config(th.get("modifiers", []) or [], th.get("key", "F4"))
         if hotkeys_conflict(mask, vk, th_mask, th_vk):
-            logger.error("update_exit_hotkey_in_thread: конфликт с translate hotkey; пропускаю регистрацию case")
+            logger.error("update_case_hotkey_in_thread: конфликт с translate hotkey; пропускаю регистрацию case")
             try:
                 win32api.MessageBox(
                     0,
-                    f"Не удалось зарегистрировать комбинацию выхода {'+'.join(mods) + '+' if mods else ''}{key} — конфликт с комбинацией перевода.",
+                    f"Не удалось зарегистрировать комбинацию регистра {'+'.join(mods) + '+' if mods else ''}{key} — конфликт с комбинацией перевода.",
                     "KeyFlip",
                     0,
                 )
@@ -1153,11 +1497,11 @@ def update_case_hotkey_in_thread() -> None:
         eh = read_exit_hotkey()
         eh_mask, eh_vk = hotkey_tuple_from_config(eh.get("modifiers", []) or [], eh.get("key", "F10"))
         if hotkeys_conflict(mask, vk, eh_mask, eh_vk):
-            logger.error("update_translate_hotkey_in_thread: конфликт с exit hotkey; пропускаю регистрацию case")
+            logger.error("update_case_hotkey_in_thread: конфликт с exit hotkey; пропускаю регистрацию case")
             try:
                 win32api.MessageBox(
                     0,
-                    f"Не удалось зарегистрировать комбинацию перевода {'+'.join(mods) + '+' if mods else ''}{key} — конфликт с комбинацией выхода.",
+                    f"Не удалось зарегистрировать комбинацию регистра {'+'.join(mods) + '+' if mods else ''}{key} — конфликт с комбинацией выхода.",
                     "KeyFlip",
                     0,
                 )
@@ -1378,8 +1722,8 @@ def capture_hotkey_via_hook_blocking(timeout: float | None = 10.0, show_dialog: 
 
 def hotkey_lists_equal(a_mods: list | None, a_key: str, b_mods: list | None, b_key: str) -> bool:
     """Сравнить две комбинации модификаторов+клавиша."""
-    a_norm = set((m or "").upper() for m in (a_mods or []))
-    b_norm = set((m or "").upper() for m in (b_mods or []))
+    a_norm = set((m or "").upper() for m in (a_mods or []) if m)
+    b_norm = set((m or "").upper() for m in (b_mods or []) if m)
     return a_norm == b_norm and ((a_key or "").upper() == (b_key or "").upper())
 
 
@@ -1417,13 +1761,13 @@ def capture_hotkey_and_apply_via_thread(target: str) -> None:
                 try:
                     win32api.MessageBox(
                         0,
-                        f"Нельзя установить комбинацию регистра {'+'.join(mods) + '+' if mods else ''}{key} — она уже используется для изменения регистра.",
+                        f"Нельзя установить комбинацию выхода {'+'.join(mods) + '+' if mods else ''}{key} — она уже используется для изменения регистра.",
                         "KeyFlip",
                         0
                     )
                 except Exception:  # noqa
                     pass
-                logger.info("Capture thread: попытка установки translate hotkey отклонена — конфликт с case")
+                logger.info("Capture thread: попытка установки exit hotkey отклонена — конфликт с case")
                 return
             ok = write_exit_hotkey(mods, key)
             if ok:
@@ -1454,7 +1798,7 @@ def capture_hotkey_and_apply_via_thread(target: str) -> None:
                 try:
                     win32api.MessageBox(
                         0,
-                        f"Нельзя установить комбинацию регистра {'+'.join(mods) + '+' if mods else ''}{key} — она уже используется для изменения регистра.",
+                        f"Нельзя установить комбинацию перевода {'+'.join(mods) + '+' if mods else ''}{key} — она уже используется для изменения регистра.",
                         "KeyFlip",
                         0
                     )
@@ -1656,7 +2000,8 @@ def win_hotkey_loop() -> None:
         except Exception:  # noqa
             pass
         try:
-            exit_event.set()
-            _invoke_exit_handlers()
+            if not exit_event.is_set():
+                exit_event.set()
+                _invoke_exit_handlers()
         except Exception:  # noqa
             pass

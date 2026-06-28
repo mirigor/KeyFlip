@@ -5,7 +5,7 @@
 - пути и константы (APP_NAME, BASE_DIR, CONFIG_FILE, ICON_* и т.д.)
 - чтение/запись JSON-конфига
 - флаги file_logging, autorun
-- чтение/запись хоткеев (exit/translate)
+- чтение/запись хоткеев (exit/translate/case)
 - управление enabled (в памяти + сохранение)
 - создание/удаление ярлыка в автозагрузке
 """
@@ -25,19 +25,21 @@ CONFIG_FILE = os.path.join(BASE_DIR, "keyflip.json")
 
 # локальный логгер (handlers будут настроены в logging_setup.py)
 logger = logging.getLogger(APP_NAME)
+_config_lock = threading.RLock()
 
 
 # ---------------- Работа с JSON конфигом ----------------
 def read_json_config() -> dict:
     """Прочитать JSON-конфиг и вернуть словарь (или пустой словарь при ошибке/отсутствии)."""
     try:
-        if not os.path.isfile(CONFIG_FILE):
-            return {}
-        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f) or {}
-            if not isinstance(data, dict):
+        with _config_lock:
+            if not os.path.isfile(CONFIG_FILE):
                 return {}
-            return data
+            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f) or {}
+                if not isinstance(data, dict):
+                    return {}
+                return data
     except Exception:  # noqa
         logger.debug("read_json_config: не удалось прочитать конфиг, возвращаю {}")
         return {}
@@ -49,19 +51,20 @@ def write_json_config(j: dict) -> bool:
     Возвращает True при успехе, False при ошибке.
     """
     try:
-        tmp = CONFIG_FILE + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(j, f, ensure_ascii=False, indent=2)
-        try:
-            os.replace(tmp, CONFIG_FILE)
-        except Exception:  # noqa
-            # fallback: удалить старый и переименовать
+        with _config_lock:
+            tmp = CONFIG_FILE + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(j, f, ensure_ascii=False, indent=2)
             try:
-                if os.path.exists(CONFIG_FILE):
-                    os.remove(CONFIG_FILE)
+                os.replace(tmp, CONFIG_FILE)
             except Exception:  # noqa
-                pass
-            os.rename(tmp, CONFIG_FILE)
+                # fallback: удалить старый и переименовать
+                try:
+                    if os.path.exists(CONFIG_FILE):
+                        os.remove(CONFIG_FILE)
+                except Exception:  # noqa
+                    pass
+                os.rename(tmp, CONFIG_FILE)
         return True
     except Exception:  # noqa
         logger.exception("config: write_json_config failed")
@@ -129,12 +132,13 @@ def read_file_logging_flag() -> bool:
 def write_file_logging_flag(val: bool) -> bool:
     """Записать флаг file_logging в конфиг."""
     try:
-        j = read_json_config()
-        # сохраняем существующие поля, но гарантируем наличие нужных
-        j.setdefault("enabled", True)
-        j.setdefault("autorun", False)
-        j["file_logging"] = bool(val)
-        ok = write_json_config(j)
+        with _config_lock:
+            j = read_json_config()
+            # сохраняем существующие поля, но гарантируем наличие нужных
+            j.setdefault("enabled", True)
+            j.setdefault("autorun", False)
+            j["file_logging"] = bool(val)
+            ok = write_json_config(j)
         if ok:
             logger.info("config: записан file_logging=%s", j["file_logging"])
         return ok
@@ -208,11 +212,12 @@ def read_autorun_flag() -> bool:
 def write_autorun_flag(val: bool) -> bool:
     """Записать флаг autorun в конфиг."""
     try:
-        j = read_json_config()
-        j.setdefault("enabled", True)
-        j.setdefault("file_logging", False)
-        j["autorun"] = bool(val)
-        ok = write_json_config(j)
+        with _config_lock:
+            j = read_json_config()
+            j.setdefault("enabled", True)
+            j.setdefault("file_logging", False)
+            j["autorun"] = bool(val)
+            ok = write_json_config(j)
         if ok:
             logger.info("config: записан autorun=%s", j["autorun"])
         return ok
@@ -256,14 +261,15 @@ def read_exit_hotkey() -> dict:
 def write_exit_hotkey(modifiers: list[str], key: str) -> bool:
     """Нормализовать и записать exit_hotkey в конфиг."""
     try:
-        j = read_json_config()
-        # гарантируем базовые поля
-        j.setdefault("enabled", True)
-        j.setdefault("file_logging", False)
-        j.setdefault("autorun", False)
-        mods = _normalize_modifiers_list(modifiers)
-        j["exit_hotkey"] = {"modifiers": mods, "key": str(key)}
-        ok = write_json_config(j)
+        with _config_lock:
+            j = read_json_config()
+            # гарантируем базовые поля
+            j.setdefault("enabled", True)
+            j.setdefault("file_logging", False)
+            j.setdefault("autorun", False)
+            mods = _normalize_modifiers_list(modifiers)
+            j["exit_hotkey"] = {"modifiers": mods, "key": str(key)}
+            ok = write_json_config(j)
         if ok:
             logger.info("config: записан exit_hotkey=%s", j["exit_hotkey"])
         return ok
@@ -295,13 +301,14 @@ def read_translate_hotkey() -> dict:
 def write_translate_hotkey(modifiers: list[str], key: str) -> bool:
     """Нормализовать и записать translate_hotkey в конфиг."""
     try:
-        j = read_json_config()
-        j.setdefault("enabled", True)
-        j.setdefault("file_logging", False)
-        j.setdefault("autorun", False)
-        mods = _normalize_modifiers_list(modifiers)
-        j["translate_hotkey"] = {"modifiers": mods, "key": str(key)}
-        ok = write_json_config(j)
+        with _config_lock:
+            j = read_json_config()
+            j.setdefault("enabled", True)
+            j.setdefault("file_logging", False)
+            j.setdefault("autorun", False)
+            mods = _normalize_modifiers_list(modifiers)
+            j["translate_hotkey"] = {"modifiers": mods, "key": str(key)}
+            ok = write_json_config(j)
         if ok:
             logger.info("config: записан translate_hotkey=%s", j["translate_hotkey"])
         return ok
@@ -332,13 +339,14 @@ def read_case_hotkey() -> dict:
 def write_case_hotkey(modifiers: list[str], key: str) -> bool:
     """Нормализовать и записать case_hotkey в конфиг."""
     try:
-        j = read_json_config()
-        j.setdefault("enabled", True)
-        j.setdefault("file_logging", False)
-        j.setdefault("autorun", False)
-        mods = _normalize_modifiers_list(modifiers)
-        j["case_hotkey"] = {"modifiers": mods, "key": str(key)}
-        ok = write_json_config(j)
+        with _config_lock:
+            j = read_json_config()
+            j.setdefault("enabled", True)
+            j.setdefault("file_logging", False)
+            j.setdefault("autorun", False)
+            mods = _normalize_modifiers_list(modifiers)
+            j["case_hotkey"] = {"modifiers": mods, "key": str(key)}
+            ok = write_json_config(j)
         if ok:
             logger.info("config: записан case_hotkey=%s", j["case_hotkey"])
         return ok
@@ -359,14 +367,16 @@ def load_config() -> None:
     """
     global _enabled
     try:
-        j = read_json_config()
-        if not isinstance(j, dict):
-            j = {}
-        changed = _ensure_defaults_in(j)
-        _enabled = bool(j.get("enabled", True))
-        if changed:
-            # перезапишем конфиг, если добавили дефолты
-            write_json_config(j)
+        with _config_lock:
+            j = read_json_config()
+            if not isinstance(j, dict):
+                j = {}
+            changed = _ensure_defaults_in(j)
+            with _enabled_lock:
+                _enabled = bool(j.get("enabled", True))
+            if changed:
+                # перезапишем конфиг, если добавили дефолты
+                write_json_config(j)
     except Exception:  # noqa
         logger.exception("config: load_config failed - using defaults")
 
@@ -377,11 +387,12 @@ def save_config() -> None:
     Сохраняет остальные ключи, если они есть.
     """
     try:
-        with _enabled_lock:
-            enabled_val = bool(_enabled)
-        j = read_json_config() or {}
-        j["enabled"] = enabled_val
-        write_json_config(j)
+        with _config_lock:
+            with _enabled_lock:
+                enabled_val = bool(_enabled)
+            j = read_json_config() or {}
+            j["enabled"] = enabled_val
+            write_json_config(j)
         logger.debug("config: saved enabled=%s to %s", enabled_val, CONFIG_FILE)
     except Exception:  # noqa
         logger.exception("config: save failed")

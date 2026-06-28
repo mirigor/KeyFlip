@@ -2,13 +2,14 @@
 Инициализация логгера для KeyFlip.
 
 Этот модуль настраивает:
-- ротационный файловый хендлер (с фильтром, который читает флаг file_logging из конфига)
+- ротационный файловый хендлер (с фильтром по кэшированному флагу file_logging)
 - консольный хендлер (stdout)
 - общий логгер доступен как `logger`
 """
 
 import logging
 import sys
+import threading
 from logging.handlers import RotatingFileHandler
 
 from config import LOG_FILE, APP_NAME, read_file_logging_flag
@@ -16,9 +17,25 @@ from config import LOG_FILE, APP_NAME, read_file_logging_flag
 # Получаем логгер (config.py тоже использует logging.getLogger(APP_NAME) — ссылка на один объект)
 logger = logging.getLogger(APP_NAME)
 logger.setLevel(logging.DEBUG)
+_file_logging_lock = threading.Lock()
+_file_logging_enabled = bool(read_file_logging_flag())
 
 # Форматтер
 fmt = logging.Formatter("%(asctime)s %(levelname)s [%(threadName)s] %(message)s", "%Y-%m-%d %H:%M:%S")
+
+
+def set_file_logging_enabled(val: bool) -> None:
+    """Обновить кэшированный флаг файлового логирования."""
+    global _file_logging_enabled
+    with _file_logging_lock:
+        _file_logging_enabled = bool(val)
+
+
+def is_file_logging_enabled() -> bool:
+    """Вернуть кэшированный флаг файлового логирования без чтения JSON на каждый log record."""
+    with _file_logging_lock:
+        return bool(_file_logging_enabled)
+
 
 # ---------------- Файловый хендлер с фильтром ----------------
 def _create_file_handler() -> RotatingFileHandler:
@@ -26,19 +43,19 @@ def _create_file_handler() -> RotatingFileHandler:
     Создать RotatingFileHandler с фильтром, который проверяет флаг file_logging.
     Возвращает созданный handler (еще не привязан к логгеру).
     """
-    fh = RotatingFileHandler(LOG_FILE, maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8")
+    fh = RotatingFileHandler(LOG_FILE, maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8", delay=True)
     fh.setFormatter(fmt)
     fh.setLevel(logging.DEBUG)
 
     class FileLoggingFilter(logging.Filter):
         """
-        Фильтр, который при каждой попытке логгирования проверяет флаг file_logging в конфиге.
+        Фильтр, который при каждой попытке логгирования проверяет кэшированный флаг file_logging.
         Если флаг выключен — записи в файл не происходит.
         """
 
         def filter(self, record: logging.LogRecord) -> bool:  # type: ignore[override]
             try:
-                return bool(read_file_logging_flag())
+                return is_file_logging_enabled()
             except Exception:  # noqa
                 # При ошибке безопасности — не логировать в файл.
                 return False

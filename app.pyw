@@ -9,6 +9,7 @@
 - ожидание завершения через exit_event
 """
 
+import importlib.util
 import sys
 import threading
 import time
@@ -17,23 +18,28 @@ from typing import Optional
 
 from config import APP_NAME, MUTEX_NAME, load_config, apply_autorun_setting
 from logging_setup import logger
-from tray import tray_worker, on_exit
-from winapi import win_hotkey_loop, exit_event, register_exit_handler
+
+_DEPENDENCY_IMPORT_ERROR: Exception | None = None
 
 try:
-    import pyperclip
-    from PIL import Image, ImageDraw
-    from pystray import Menu, MenuItem, Icon
-    import psutil
-    import win32event
+    import pyperclip  # noqa: F401
+    import psutil  # noqa: F401
     import win32api
-    import win32con
-except Exception:  # noqa
-    print(
-        "❌ Требуются библиотеки: pyperclip, Pillow, pystray, psutil, pywin32\n"
-        "Установи командой:\n"
-        "   pip install pyperclip pillow pystray psutil pywin32"
-    )
+    import win32con  # noqa: F401
+    import win32event
+    import win32com.client  # noqa: F401
+    from PIL import Image, ImageDraw  # noqa: F401
+    from pystray import Icon, Menu, MenuItem  # noqa: F401
+except Exception as e:  # noqa
+    _DEPENDENCY_IMPORT_ERROR = e
+
+
+def _module_available(module_name: str) -> bool:
+    """Проверить наличие модуля без аварийного падения при странном состоянии пакета."""
+    try:
+        return importlib.util.find_spec(module_name) is not None
+    except Exception:  # noqa
+        return False
 
 
 def check_dependencies() -> None:
@@ -47,32 +53,40 @@ def check_dependencies() -> None:
         "pystray": "pystray",
         "psutil": "psutil",
         "win32api": "pywin32",
-        "win32com": "pywin32",
+        "win32com.client": "pywin32",
+        "win32con": "pywin32",
+        "win32event": "pywin32",
     }
 
     for module_name, pip_name in required.items():
-        try:
-            __import__(module_name)
-        except ImportError:
+        if not _module_available(module_name) and pip_name not in missing:
             missing.append(pip_name)
 
-    if not missing:
+    if not missing and _DEPENDENCY_IMPORT_ERROR is None:
         return
 
     title = "KeyFlip — ошибка зависимостей"
+    details = ""
+    if _DEPENDENCY_IMPORT_ERROR is not None:
+        details = (
+            "\n\nДетали ошибки импорта:\n"
+            f"{type(_DEPENDENCY_IMPORT_ERROR).__name__}: {_DEPENDENCY_IMPORT_ERROR}"
+        )
     msg = (
-        f"❌ KeyFlip не может запуститься — отсутствуют библиотеки:\n\n"
-        f"{' '.join(missing)}\n\n"
-        f"Установи одной командой:\n"
-        f"pip install {' '.join(missing)}\n\n"
-        f"После установки перезапусти приложение."
+        "❌ KeyFlip не может запуститься — отсутствуют или некорректно работают библиотеки:\n\n"
+        f"{' '.join(missing) if missing else 'см. детали ниже'}\n\n"
+        "Установи одной командой:\n"
+        "pip install -r requirements.txt\n\n"
+        f"После установки перезапусти приложение.{details}"
     )
-    root = Tk()
-    root.withdraw()  # скрываем главное окно
-    messagebox.showerror(title, msg)
-    root.destroy()
+    try:
+        root = Tk()
+        root.withdraw()  # скрываем главное окно
+        messagebox.showerror(title, msg)
+        root.destroy()
+    except Exception:  # noqa
+        print(msg)
     sys.exit(1)
-
 
 
 # Код ошибки, когда mutex уже существует (Windows)
@@ -130,7 +144,7 @@ def _release_mutex(mutex_handle: Optional[int]) -> None:
         logger.exception("_release_mutex: unexpected exception")
 
 
-def _start_worker_threads() -> tuple[threading.Thread, threading.Thread]:
+def _start_worker_threads(win_hotkey_loop, tray_worker) -> tuple[threading.Thread, threading.Thread]:
     """
     Запустить два daemon-потока:
     - WinHotkeyThread: loop для обработки WM_HOTKEY и внутренних сообщений
@@ -157,6 +171,9 @@ def main() -> None:
         sys.exit(0)
 
     # Подключаем обработчик выхода (чтобы on_exit вызывался из winapi при нажатии exit-hotkey)
+    from tray import tray_worker, on_exit
+    from winapi import win_hotkey_loop, exit_event, register_exit_handler
+
     try:
         register_exit_handler(on_exit)
     except Exception:  # noqa
@@ -175,7 +192,7 @@ def main() -> None:
 
     # Запуск потоков
     try:
-        hk_thread, tray_thread = _start_worker_threads()
+        hk_thread, tray_thread = _start_worker_threads(win_hotkey_loop, tray_worker)
     except Exception as e:  # noqa
         logger.exception("Не удалось запустить потоки: %s", e)
         _release_mutex(mutex_handle)

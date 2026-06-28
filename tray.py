@@ -30,7 +30,7 @@ from config import (
     is_enabled,
     set_enabled,
 )
-from logging_setup import logger
+from logging_setup import logger, set_file_logging_enabled
 from winapi import (
     post_register_translate,
     post_update_exit_hotkey,
@@ -116,6 +116,7 @@ def toggle_file_logging(_icon: Icon | None, _item: MenuItem | None) -> None:
         new = not current
         ok = write_file_logging_flag(new)
         if ok:
+            set_file_logging_enabled(new)
             logger.info("Tray: file_logging toggled -> %s", new)
         else:
             logger.warning("Tray: file_logging toggle attempted but write failed")
@@ -144,7 +145,7 @@ def toggle_autorun(_icon: Icon | None, _item: MenuItem | None) -> None:
 # ---------------- Хоткеи: сравнение / форматирование ----------------
 def _normalize_mods(mods: list | None) -> set[str]:
     """Нормализовать список модификаторов в set строк в верхнем регистре."""
-    return set((m or "").upper() for m in (mods or []))
+    return set((m or "").upper() for m in (mods or []) if m)
 
 
 def hotkey_lists_equal(a_mods: list | None, a_key: str, b_mods: list | None, b_key: str) -> bool:
@@ -165,9 +166,10 @@ def is_translate_hotkey_equal(expected_mods: list[str], expected_key: str) -> bo
 
 
 def is_case_hotkey_equal(expected_mods: list[str], expected_key: str) -> bool:
-    """Проверить, совпадает ли текущая комбинация 'регист' с ожидаемой."""
+    """Проверить, совпадает ли текущая комбинация регистра с ожидаемой."""
     ch = read_case_hotkey()
     return hotkey_lists_equal(ch.get("modifiers", []) or [], ch.get("key", ""), expected_mods, expected_key)
+
 
 def format_exit_hotkey_display(_item: MenuItem | None = None) -> str:
     """Формат строки для отображения комбинации выхода в трее."""
@@ -204,9 +206,9 @@ def format_case_hotkey_display(_item: MenuItem | None = None) -> str:
     key = (ch.get("key") or "").upper()
     if not key:
         return "Регистр: (нет)"
+    if _normalize_mods(mods) == {"CTRL", "SHIFT"} and key == "U":
+        return "Регистр: Ctrl+Shift+U (по умолчанию)"
     if not mods:
-        if key == "U":
-            return "Регистр: Ctrl+Shift+U (по умолчанию)"
         return f"Регистр: {key}"
     return f"Регистр: {'+'.join(m.upper() for m in mods)}+{key}"
 
@@ -239,7 +241,7 @@ def _set_hotkey_and_apply(mods: list[str], key: str, target: str) -> bool:
             other2 = read_case_hotkey()
             if hotkey_lists_equal(mods, key, other2.get("modifiers", []) or [], other2.get("key", "")):
                 _show_conflict_messagebox(
-                    f"Нельзя установить комбинацию регистра {'+'.join(mods) + '+' if mods else ''}{key} — она уже используется для изменения регистра."
+                    f"Нельзя установить комбинацию выхода {'+'.join(mods) + '+' if mods else ''}{key} — она уже используется для изменения регистра."
                 )
                 return False
             ok = write_exit_hotkey(mods, key)
@@ -257,7 +259,7 @@ def _set_hotkey_and_apply(mods: list[str], key: str, target: str) -> bool:
             other2 = read_case_hotkey()
             if hotkey_lists_equal(mods, key, other2.get("modifiers", []) or [], other2.get("key", "")):
                 _show_conflict_messagebox(
-                    f"Нельзя установить комбинацию регистра {'+'.join(mods) + '+' if mods else ''}{key} — она уже используется для изменения регистра."
+                    f"Нельзя установить комбинацию перевода {'+'.join(mods) + '+' if mods else ''}{key} — она уже используется для изменения регистра."
                 )
                 return False
             ok = write_translate_hotkey(mods, key)
@@ -314,7 +316,8 @@ menu_set_translate_f4 = _make_preset_setter([], "F4", "translate")
 menu_set_translate_ctrl_alt_t = _make_preset_setter(["CTRL", "ALT"], "T", "translate")
 menu_set_translate_ctrl_shift_y = _make_preset_setter(["CTRL", "SHIFT"], "Y", "translate")
 
-menu_set_case_ctrl_alt_u = _make_preset_setter(["CTRL", "SHIFT"], "U", "case")
+menu_set_case_ctrl_shift_u = _make_preset_setter(["CTRL", "SHIFT"], "U", "case")
+
 
 def menu_set_exit_custom_capture(_icon: Icon | None, _item: MenuItem | None) -> None:
     """Поймать комбинацию для выхода в отдельном потоке."""
@@ -411,7 +414,7 @@ def tray_worker() -> None:
         MenuItem(
             "Комбинация регистра",
             Menu(
-                MenuItem("Ctrl+Shift+U (по умолчанию)", menu_set_case_ctrl_alt_u,
+                MenuItem("Ctrl+Shift+U (по умолчанию)", menu_set_case_ctrl_shift_u,
                          checked=lambda item: is_case_hotkey_equal(["CTRL", "SHIFT"], "U")),
                 MenuItem("Ввести свою комбинацию...", menu_set_case_custom_capture,
                          checked=lambda item: not is_case_hotkey_equal(["CTRL", "SHIFT"], "U")),
