@@ -1,5 +1,6 @@
 .idea/
 .venv/
+KeyFlip.lnk
 __pycache__/
 *.py[cod]
 keyflip.json
