@@ -35,6 +35,7 @@ from config import (
 )
 from logging_setup import logger
 from transform import transform_text_by_keyboard_layout_based_on_hkl, change_case_by_logic
+from hotkeys import VK_MAP, hotkeys_equal, normalize_modifiers, key_name_to_vk as parse_key_name
 
 # ---------------- ctypes helpers ----------------
 user32 = ctypes.windll.user32
@@ -81,6 +82,7 @@ MSG_UNREGISTER_CASE = WM_USER + 6
 MSG_UPDATE_CASE_HOTKEY = WM_USER + 7
 
 HOTKEY_THREAD_ID = 0
+hotkey_ready = threading.Event()
 
 # Side-specific VK constants (для safe_copy и hook)
 VK_LSHIFT = 0xA0
@@ -98,6 +100,7 @@ MOD_ALT = 0x0001
 MOD_CONTROL = 0x0002
 MOD_SHIFT = 0x0004
 MOD_WIN = 0x0008
+MOD_NOREPEAT = 0x4000
 
 # Clipboard formats / memory flags
 CF_BITMAP = 2
@@ -122,8 +125,18 @@ class KEYBDINPUT(ctypes.Structure):
     ]
 
 
+class MOUSEINPUT(ctypes.Structure):
+    _fields_ = [("dx", wintypes.LONG), ("dy", wintypes.LONG),
+                ("mouseData", wintypes.DWORD), ("dwFlags", wintypes.DWORD),
+                ("time", wintypes.DWORD), ("dwExtraInfo", ULONG_PTR)]
+
+
+class HARDWAREINPUT(ctypes.Structure):
+    _fields_ = [("uMsg", wintypes.DWORD), ("wParamL", wintypes.WORD), ("wParamH", wintypes.WORD)]
+
+
 class InputUnion(ctypes.Union):
-    _fields_ = [("ki", KEYBDINPUT), ("padding", wintypes.ULONG * 8)]
+    _fields_ = [("ki", KEYBDINPUT), ("mi", MOUSEINPUT), ("hi", HARDWAREINPUT)]
 
 
 class INPUT(ctypes.Structure):
@@ -226,15 +239,6 @@ gdi32.CopyEnhMetaFileW.argtypes = (wintypes.HANDLE, wintypes.LPCWSTR)
 gdi32.CopyEnhMetaFileW.restype = wintypes.HANDLE
 gdi32.DeleteEnhMetaFile.argtypes = (wintypes.HANDLE,)
 gdi32.DeleteEnhMetaFile.restype = wintypes.BOOL
-
-# ---------------- VK map for readable names ----------------
-VK_MAP = {
-    "F1": 0x70, "F2": 0x71, "F3": 0x72, "F4": 0x73, "F5": 0x74, "F6": 0x75,
-    "F7": 0x76, "F8": 0x77, "F9": 0x78, "F10": 0x79, "F11": 0x7A, "F12": 0x7B,
-    "ESC": 0x1B, "TAB": 0x09, "ENTER": 0x0D, "RETURN": 0x0D, "SPACE": 0x20,
-    "INSERT": 0x2D, "DELETE": 0x2E, "HOME": 0x24, "END": 0x23, "PGUP": 0x21, "PGDN": 0x22,
-    "LEFT": 0x25, "UP": 0x26, "RIGHT": 0x27, "DOWN": 0x28,
-}
 
 # ---------------- Public primitives ----------------
 exit_event = threading.Event()
@@ -342,6 +346,10 @@ def _append_unicode_code_unit(inputs: list, code_unit: int) -> None:
         pass
 
 
+class PartialInputError(RuntimeError):
+    """Часть текста уже введена: повторная вставка всего текста недопустима."""
+
+
 def send_unicode_via_sendinput(text: str, delay_between_keys: float = 0.001) -> bool:
     """
     Вставить текст через SendInput (UNICODE), но во всех случаях заменять переносы строк
@@ -395,11 +403,28 @@ def send_unicode_via_sendinput(text: str, delay_between_keys: float = 0.001) -> 
             return False
         if sent != n:
             logger.warning("send_unicode_via_sendinput: SendInput sent %d of %d events", sent, n)
+            pending = {}
+            for entry in inputs[:sent]:
+                key = (entry.ki.wVk, entry.ki.wScan)
+                if entry.ki.dwFlags & KEYEVENTF_KEYUP:
+                    pending.pop(key, None)
+                else:
+                    pending[key] = entry.ki
+            for event in pending.values():
+                release = INPUT(INPUT_KEYBOARD, InputUnion(ki=KEYBDINPUT(
+                    event.wVk, event.wScan, event.dwFlags | KEYEVENTF_KEYUP, 0, 0)))
+                try:
+                    SendInput(1, ctypes.pointer(release), ctypes.sizeof(INPUT))
+                except Exception:
+                    logger.exception("Не удалось отпустить клавишу после частичной вставки")
+            raise PartialInputError(f"Отправлено {sent} из {n} событий ввода")
         if used_shift_enter:
             logger.debug("send_unicode_via_sendinput: использован Shift+Enter для переносов строк")
         if delay_between_keys > 0:
             time.sleep(delay_between_keys)
         return True
+    except PartialInputError:
+        raise
     except Exception:  # noqa
         logger.exception("send_unicode_via_sendinput: exception")
         return False
@@ -441,7 +466,8 @@ def get_active_window_info() -> tuple[str, int, str | None]:
 
 
 # ---------------- Clipboard helper (safe copy) ----------------
-def safe_copy_from_selection(timeout_per_attempt: float = 0.6, max_attempts: int = 2) -> tuple[str, set[int]]:
+def safe_copy_from_selection(timeout_per_attempt: float = 0.6, max_attempts: int = 2,
+                             expected_hwnd: int | None = None) -> tuple[str, set[int]]:
     """
     Осторожно скопировать выделение (попытки Ctrl+C, Ctrl+Insert).
     Возвращает (строка, set_of_pressed_side_specific_vk).
@@ -449,17 +475,19 @@ def safe_copy_from_selection(timeout_per_attempt: float = 0.6, max_attempts: int
     title, pid, proc_name = get_active_window_info()
     logger.debug("safe_copy: start. active window: %r pid=%s proc=%r", title, pid, proc_name)
     try:
-        initial_hwnd = user32.GetForegroundWindow()
+        initial_hwnd = expected_hwnd or user32.GetForegroundWindow()
     except Exception as e:  # noqa
         logger.debug("safe_copy: GetForegroundWindow failed: %s", e)
         initial_hwnd = None
 
     def foreground_changed() -> bool:
+        if exit_event.is_set() or not is_enabled():
+            return True
         try:
             cur_hwnd = user32.GetForegroundWindow()
-            return initial_hwnd is not None and cur_hwnd is not None and cur_hwnd != initial_hwnd
+            return not initial_hwnd or cur_hwnd != initial_hwnd
         except Exception:  # noqa
-            return False
+            return True
 
     try:
         old_seq = user32.GetClipboardSequenceNumber()
@@ -918,33 +946,52 @@ def _release_modifiers_after_hotkey(vks: set[int]) -> None:
 _handler_lock = threading.Lock()
 _last_translate_ts = 0.0
 _TRANSLATE_DEBOUNCE_SEC = 0.6
+_handler_thread: threading.Thread | None = None
 
 
-def _translate_invoker() -> None:
-    """Дебаунс и запуск worker-потока для обработки translate hotkey."""
-    global _last_translate_ts
-    if not is_enabled():
-        logger.debug("Translate: ignored because enabled==False")
+def _invoke_text_handler(handler: Callable[[], None]) -> None:
+    """Один worker для обеих операций; отклонённые нажатия не продлевают debounce."""
+    global _last_translate_ts, _handler_thread
+    if not is_enabled() or exit_event.is_set():
         return
-    now = time.time()
-    if now - _last_translate_ts < _TRANSLATE_DEBOUNCE_SEC:
-        logger.debug("Translate: debounce ignored (delta=%.3f)", now - _last_translate_ts)
-        return
-    _last_translate_ts = now
     if not _handler_lock.acquire(blocking=False):
-        logger.debug("Translate: handler busy, ignored")
         return
+    now = time.monotonic()
+    if now - _last_translate_ts < _TRANSLATE_DEBOUNCE_SEC:
+        _handler_lock.release()
+        return
+    previous_ts = _last_translate_ts
+    _last_translate_ts = now
 
     def _worker() -> None:
         try:
-            handle_hotkey_transform()
+            if is_enabled() and not exit_event.is_set():
+                handler()
         finally:
-            try:
-                _handler_lock.release()
-            except Exception:  # noqa
-                pass
+            _handler_lock.release()
 
-    threading.Thread(target=_worker, daemon=True).start()
+    try:
+        _handler_thread = threading.Thread(target=_worker, name="TextTransformThread", daemon=True)
+        _handler_thread.start()
+    except Exception:
+        _last_translate_ts = previous_ts
+        _handler_lock.release()
+        raise
+
+
+def _translate_invoker() -> None:
+    _invoke_text_handler(handle_hotkey_transform)
+
+
+def wait_for_pending_operations(timeout: float = 5.0) -> None:
+    """Даёт worker завершить восстановление буфера перед выходом процесса."""
+    worker = _handler_thread
+    if worker is not None and worker is not threading.current_thread() and worker.ident is not None:
+        worker.join(timeout)
+
+
+def _can_edit_window(hwnd) -> bool:
+    return bool(hwnd) and not exit_event.is_set() and is_enabled() and user32.GetForegroundWindow() == hwnd
 
 
 def handle_hotkey_transform() -> None:
@@ -954,17 +1001,20 @@ def handle_hotkey_transform() -> None:
     saved_clipboard_ok = False
     saved_clipboard_snapshot: list[ClipboardPayload] = []
     clipboard_restore_delay = 0.05
+    copy_attempted = False
     try:
         if not is_enabled():
             logger.debug("handle: disabled, returning")
             return
         title, pid, proc_name = get_active_window_info()
         logger.info("handle: active window: %r pid=%s proc=%r", title, pid, proc_name)
+        hwnd = user32.GetForegroundWindow()
         saved_clipboard_ok, saved_clipboard_snapshot = _save_clipboard_for_restore("handle")
+        if not saved_clipboard_ok:
+            logger.warning("handle: не удалось сохранить буфер — операция отменена")
+            return
 
-        hwnd = None
         try:
-            hwnd = user32.GetForegroundWindow()
             pid_c = wintypes.DWORD()
             thread_id = user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid_c))
             hkl = user32.GetKeyboardLayout(thread_id) & 0xFFFF
@@ -973,7 +1023,8 @@ def handle_hotkey_transform() -> None:
             hkl = 0
             logger.exception("handle: не удалось получить HKL, предполагаем EN")
 
-        res = safe_copy_from_selection(timeout_per_attempt=0.6, max_attempts=2)
+        copy_attempted = True
+        res = safe_copy_from_selection(timeout_per_attempt=0.6, max_attempts=2, expected_hwnd=hwnd)
         if isinstance(res, tuple):
             selected, pressed_vks = res
         else:
@@ -995,20 +1046,27 @@ def handle_hotkey_transform() -> None:
 
         converted = transform_text_by_keyboard_layout_based_on_hkl(selected, hkl)
         logger.info("handle: преобразование выполнено (len=%d).", len(converted))
-        logger.debug("handle: исходное=%r converted=%r", selected, converted)
         if converted == selected:
             logger.info("handle: преобразованный текст совпадает с исходным — ничего не меняю.")
             return
 
         try:
+            if not _can_edit_window(hwnd):
+                logger.info("handle: окно изменилось или обработка отменена — вставка отменена")
+                return
             if not send_unicode_via_sendinput(converted, delay_between_keys=0.001):
                 raise RuntimeError("SendInput did not send unicode text")
             logger.debug("handle: вставил через SendInput (unicode) — без использования clipboard")
+        except PartialInputError:
+            logger.exception("handle: текст вставлен не полностью; повторная вставка отменена")
+            return
         except Exception as e:  # noqa
             logger.exception("handle: send_unicode_via_sendinput failed: %s", e)
             try:
                 pyperclip.copy(converted)
                 time.sleep(0.02)
+                if not _can_edit_window(hwnd):
+                    return
                 send_ctrl_v()
                 clipboard_restore_delay = 0.2
                 logger.debug("handle: fallback: вставил через буфер (ctrl+v)")
@@ -1016,7 +1074,7 @@ def handle_hotkey_transform() -> None:
                 logger.exception("handle: fallback paste failed: %s", e2)
 
         try:
-            if hwnd:
+            if _can_edit_window(hwnd):
                 if hkl == 0x0419:
                     new_klid = "00000409"
                 else:
@@ -1051,37 +1109,15 @@ def handle_hotkey_transform() -> None:
             logger.exception("handle: failed to restore clipboard")
         try:
             logger.debug("handle: releasing modifiers after hotkey vks=%r", pressed_vks)
-            _release_modifiers_after_hotkey(pressed_vks)
+            if copy_attempted:
+                _release_modifiers_after_hotkey(pressed_vks)
         except Exception:  # noqa
             logger.exception("handle: failed to release modifiers")
 
 
 # ---------------- Case handler (debounce + worker) ----------------
 def _case_invoker() -> None:
-    """Дебаунс и запуск worker-потока для обработки case hotkey."""
-    global _last_translate_ts
-    if not is_enabled():
-        logger.debug("Case: ignored because enabled==False")
-        return
-    now = time.time()
-    if now - _last_translate_ts < _TRANSLATE_DEBOUNCE_SEC:
-        logger.debug("Case: debounce ignored (delta=%.3f)", now - _last_translate_ts)
-        return
-    _last_translate_ts = now
-    if not _handler_lock.acquire(blocking=False):
-        logger.debug("Case: handler busy, ignored")
-        return
-
-    def _worker() -> None:
-        try:
-            handle_hotkey_case()
-        finally:
-            try:
-                _handler_lock.release()
-            except Exception:  # noqa
-                pass
-
-    threading.Thread(target=_worker, daemon=True).start()
+    _invoke_text_handler(handle_hotkey_case)
 
 
 def handle_hotkey_case() -> None:
@@ -1091,15 +1127,21 @@ def handle_hotkey_case() -> None:
     saved_clipboard_ok = False
     saved_clipboard_snapshot: list[ClipboardPayload] = []
     clipboard_restore_delay = 0.05
+    copy_attempted = False
     try:
         if not is_enabled():
             logger.debug("handle_case: disabled, returning")
             return
         title, pid, proc_name = get_active_window_info()
         logger.info("handle_case: active window: %r pid=%s proc=%r", title, pid, proc_name)
+        hwnd = user32.GetForegroundWindow()
         saved_clipboard_ok, saved_clipboard_snapshot = _save_clipboard_for_restore("handle_case")
+        if not saved_clipboard_ok:
+            logger.warning("handle_case: не удалось сохранить буфер — операция отменена")
+            return
 
-        res = safe_copy_from_selection(timeout_per_attempt=0.6, max_attempts=2)
+        copy_attempted = True
+        res = safe_copy_from_selection(timeout_per_attempt=0.6, max_attempts=2, expected_hwnd=hwnd)
         if isinstance(res, tuple):
             selected, pressed_vks = res
         else:
@@ -1125,14 +1167,22 @@ def handle_hotkey_case() -> None:
             return
 
         try:
+            if not _can_edit_window(hwnd):
+                logger.info("handle_case: окно изменилось или обработка отменена — вставка отменена")
+                return
             if not send_unicode_via_sendinput(converted, delay_between_keys=0.001):
                 raise RuntimeError("SendInput did not send unicode text")
             logger.debug("handle_case: вставил через SendInput (unicode)")
+        except PartialInputError:
+            logger.exception("handle_case: текст вставлен не полностью; повторная вставка отменена")
+            return
         except Exception as e:  # noqa
             logger.exception("handle_case: send_unicode_via_sendinput failed: %s", e)
             try:
                 pyperclip.copy(converted)
                 time.sleep(0.02)
+                if not _can_edit_window(hwnd):
+                    return
                 send_ctrl_v()
                 clipboard_restore_delay = 0.2
                 logger.debug("handle_case: fallback: вставил через буфер (ctrl+v)")
@@ -1154,7 +1204,8 @@ def handle_hotkey_case() -> None:
             logger.exception("handle_case: failed to restore clipboard")
         try:
             logger.debug("handle_case: releasing modifiers after hotkey vks=%r", pressed_vks)
-            _release_modifiers_after_hotkey(pressed_vks)
+            if copy_attempted:
+                _release_modifiers_after_hotkey(pressed_vks)
         except Exception:  # noqa
             logger.exception("handle_case: failed to release modifiers")
 
@@ -1265,32 +1316,13 @@ def post_update_case_hotkey() -> bool:
 # ---------------- Helpers: key names / masks ----------------
 def key_name_to_vk(name: str) -> int:
     """Преобразовать читабельное имя клавиши в VK."""
-    n = (name or "").upper()
-    if not n:
-        return VK_MAP.get("F10", 0x79)
-    if n in VK_MAP:
-        return VK_MAP[n]
-    if len(n) == 1:
-        ch = n
-        if 'A' <= ch <= 'Z':
-            return ord(ch)
-        if '0' <= ch <= '9':
-            return ord(ch)
-    try:
-        if n.startswith("VK_"):
-            known_vk = int(getattr(win32con, n, 0))
-            if known_vk:
-                return known_vk
-            return int(n[3:], 16)
-    except Exception:  # noqa
-        pass
-    return VK_MAP.get("F10", 0x79)
+    return parse_key_name(name)
 
 
 def modifiers_list_to_mask(mods: list[str]) -> int:
     """Преобразовать список модификаторов в маску для RegisterHotKey."""
     mask = 0
-    for m in mods or []:
+    for m in normalize_modifiers(mods):
         mm = (m or "").upper()
         if mm in ("ALT",):
             mask |= MOD_ALT
@@ -1356,7 +1388,7 @@ def update_exit_hotkey_in_thread() -> None:
                 pass
             return
 
-        ok = user32.RegisterHotKey(None, HOTKEY_ID_EXIT, mask, vk)
+        ok = user32.RegisterHotKey(None, HOTKEY_ID_EXIT, mask | MOD_NOREPEAT, vk)
         if ok:
             logger.debug(
                 "update_exit_hotkey_in_thread: registered exit hotkey %s + %s (mask=0x%X vk=0x%X)",
@@ -1432,7 +1464,7 @@ def update_translate_hotkey_in_thread() -> None:
                 pass
             return
 
-        ok = user32.RegisterHotKey(None, HOTKEY_ID_TRANSLATE, mask, vk)
+        ok = user32.RegisterHotKey(None, HOTKEY_ID_TRANSLATE, mask | MOD_NOREPEAT, vk)
         if ok:
             logger.debug(
                 "update_translate_hotkey_in_thread: registered translate hotkey %s + %s (mask=0x%X vk=0x%X)",
@@ -1509,7 +1541,7 @@ def update_case_hotkey_in_thread() -> None:
                 pass
             return
 
-        ok = user32.RegisterHotKey(None, HOTKEY_ID_CASE, mask, vk)
+        ok = user32.RegisterHotKey(None, HOTKEY_ID_CASE, mask | MOD_NOREPEAT, vk)
         if ok:
             logger.debug("update_case_hotkey_in_thread: registered case hotkey %s + %s (mask=0x%X vk=0x%X)",
                          "+".join(mods) if mods else "(no modifiers)", key, mask, vk)
@@ -1590,6 +1622,9 @@ def vk_to_key_name(vk: int) -> str:
     return f"VK_{vk:02X}"
 
 
+_capture_lock = threading.Lock()
+
+
 def capture_hotkey_via_hook_blocking(timeout: float | None = 10.0, show_dialog: bool = True) -> dict | None:
     """
     Заблокированно захватить комбинацию клавиш через WH_KEYBOARD_LL.
@@ -1610,14 +1645,14 @@ def capture_hotkey_via_hook_blocking(timeout: float | None = 10.0, show_dialog: 
                 if vk == VK_ESCAPE:
                     result = None
                     done_event.set()
-                    return user32.CallNextHookEx(hook_handle, nCode, wParam, lParam)
+                    return 1
                 if _vk_is_modifier(vk):
                     return user32.CallNextHookEx(hook_handle, nCode, wParam, lParam)
                 mods = _current_modifiers_list()
                 keyname = vk_to_key_name(vk)
                 result = {"modifiers": mods, "key": keyname}
                 done_event.set()
-                return user32.CallNextHookEx(hook_handle, nCode, wParam, lParam)
+                return 1
             return user32.CallNextHookEx(hook_handle, nCode, wParam, lParam)
         except Exception:  # noqa
             logger.exception("capture_hotkey: hook proc exception")
@@ -1653,8 +1688,10 @@ def capture_hotkey_via_hook_blocking(timeout: float | None = 10.0, show_dialog: 
                     tk_root = tk.Tk()
                     tk_root.title("KeyFlip — введите комбинацию")
                     tk_root.attributes("-topmost", True)
-                    tk_root.geometry("360x80")
-                    label = tk.Label(tk_root, text="Нажми требуемую комбинацию (ESC — отмена)", padx=8, pady=12)
+                    tk_root.geometry("520x100")
+                    tk_root.resizable(False, False)
+                    label = tk.Label(tk_root, text="Нажмите нужное сочетание клавиш (Esc — отмена)",
+                                     padx=16, pady=12, anchor="center")
                     label.pack(fill="both", expand=True)
 
                     def on_close():
@@ -1722,9 +1759,7 @@ def capture_hotkey_via_hook_blocking(timeout: float | None = 10.0, show_dialog: 
 
 def hotkey_lists_equal(a_mods: list | None, a_key: str, b_mods: list | None, b_key: str) -> bool:
     """Сравнить две комбинации модификаторов+клавиша."""
-    a_norm = set((m or "").upper() for m in (a_mods or []) if m)
-    b_norm = set((m or "").upper() for m in (b_mods or []) if m)
-    return a_norm == b_norm and ((a_key or "").upper() == (b_key or "").upper())
+    return hotkeys_equal(a_mods, a_key, b_mods, b_key)
 
 
 def capture_hotkey_and_apply_via_thread(target: str) -> None:
@@ -1733,7 +1768,16 @@ def capture_hotkey_and_apply_via_thread(target: str) -> None:
     target: 'exit' или 'translate' или 'case'
     """
 
+    if target not in ("exit", "translate", "case") or not _capture_lock.acquire(blocking=False):
+        return
+
     def _runner() -> None:
+        try:
+            _capture_and_apply()
+        finally:
+            _capture_lock.release()
+
+    def _capture_and_apply() -> None:
         logger.info("Capture thread: ожидаю комбинацию. Нажми требуемую комбинацию (ESC для отмены).")
         res = capture_hotkey_via_hook_blocking(timeout=None, show_dialog=True)
         if not res:
@@ -1858,7 +1902,11 @@ def capture_hotkey_and_apply_via_thread(target: str) -> None:
 
     name = "ExitCaptureThread" if target == "exit" else ("TranslateCaptureThread" if target == "translate" else "CaseCaptureThread")
     t = threading.Thread(target=_runner, daemon=True, name=name)
-    t.start()
+    try:
+        t.start()
+    except Exception:
+        _capture_lock.release()
+        raise
 
 
 # ---------------- Win hotkey message loop ----------------
@@ -1868,7 +1916,11 @@ def win_hotkey_loop() -> None:
     """
     global HOTKEY_THREAD_ID
     try:
+        hotkey_ready.clear()
+        message = wintypes.MSG()
+        user32.PeekMessageW(ctypes.byref(message), None, 0, 0, win32con.PM_NOREMOVE)
         HOTKEY_THREAD_ID = kernel32.GetCurrentThreadId()
+        hotkey_ready.set()
         logger.debug("win_hotkey_loop: HOTKEY_THREAD_ID = %d", HOTKEY_THREAD_ID)
 
         # Убедимся, что exit зарегистрирован
@@ -1986,6 +2038,8 @@ def win_hotkey_loop() -> None:
     except Exception:  # noqa
         logger.exception("win_hotkey_loop: fatal exception")
     finally:
+        HOTKEY_THREAD_ID = 0
+        hotkey_ready.clear()
         logger.info("win_hotkey_loop: exiting, cleaning up")
         try:
             user32.UnregisterHotKey(None, HOTKEY_ID_EXIT)

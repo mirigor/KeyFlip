@@ -13,14 +13,19 @@
 import json
 import logging
 import os
+import sys
 import threading
+
+from hotkeys import normalize_key, normalize_modifiers
 
 APP_NAME = "KeyFlip"
 MUTEX_NAME = r"Global\KeyFlipMutex"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 LOG_FILE = os.path.join(BASE_DIR, "keyflip.log")
-ICON_ON = os.path.join(BASE_DIR, "icon_on.ico")
-ICON_OFF = os.path.join(BASE_DIR, "icon_off.ico")
+ICON_ON = os.path.join(BASE_DIR, "resources", "keyflip.ico")
+ICON_OFF = os.path.join(BASE_DIR, "resources", "keyflip-paused.ico")
+ICON_ON_SVG = os.path.join(BASE_DIR, "resources", "keyflip.svg")
+ICON_OFF_SVG = os.path.join(BASE_DIR, "resources", "keyflip-paused.svg")
 CONFIG_FILE = os.path.join(BASE_DIR, "keyflip.json")
 
 # локальный логгер (handlers будут настроены в logging_setup.py)
@@ -55,16 +60,7 @@ def write_json_config(j: dict) -> bool:
             tmp = CONFIG_FILE + ".tmp"
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(j, f, ensure_ascii=False, indent=2)
-            try:
-                os.replace(tmp, CONFIG_FILE)
-            except Exception:  # noqa
-                # fallback: удалить старый и переименовать
-                try:
-                    if os.path.exists(CONFIG_FILE):
-                        os.remove(CONFIG_FILE)
-                except Exception:  # noqa
-                    pass
-                os.rename(tmp, CONFIG_FILE)
+            os.replace(tmp, CONFIG_FILE)
         return True
     except Exception:  # noqa
         logger.exception("config: write_json_config failed")
@@ -101,22 +97,18 @@ def _ensure_defaults_in(j: dict) -> bool:
 
 def _normalize_modifiers_list(modifiers: list | None) -> list[str]:
     """Нормализовать входной список модификаторов (вернуть в верхнем регистре, единые имена)."""
-    out: list[str] = []
-    for m in (modifiers or []):
-        try:
-            mm = (m or "").upper()
-            if mm in ("CTRL", "CONTROL"):
-                out.append("CTRL")
-            elif mm in ("ALT", "MENU"):
-                out.append("ALT")
-            elif mm in ("SHIFT",):
-                out.append("SHIFT")
-            elif mm in ("WIN", "WINDOWS"):
-                out.append("WIN")
-        except Exception:  # noqa
-            # в случае странного значения — пропускаем
-            continue
-    return out
+    return normalize_modifiers(modifiers)
+
+
+def _read_hotkey(field: str, default: dict) -> dict:
+    value = read_json_config().get(field)
+    if not isinstance(value, dict) or not isinstance(value.get("modifiers", []), list):
+        return default
+    try:
+        key = normalize_key(value.get("key", default["key"]))
+    except ValueError:
+        return default
+    return {"modifiers": normalize_modifiers(value.get("modifiers", [])), "key": key}
 
 
 # ---------------- file_logging ----------------
@@ -161,11 +153,15 @@ def create_startup_shortcut() -> bool:
     try:
         # импортируем локально, чтобы не требовать win32com при каждом импорте модуля
         import win32com.client  # type: ignore  # noqa
-        import sys  # встроенный
+        os.makedirs(os.path.dirname(shortcut_path), exist_ok=True)
         shell = win32com.client.Dispatch("WScript.Shell")
         shortcut = shell.CreateShortcut(shortcut_path)
         target = sys.executable
-        script = os.path.abspath(sys.argv[0]) if hasattr(sys, "argv") and sys.argv else ""
+        script = "" if getattr(sys, "frozen", False) else os.path.join(BASE_DIR, "app.pyw")
+        if script and os.path.basename(target).lower() == "python.exe":
+            windowed = os.path.join(os.path.dirname(target), "pythonw.exe")
+            if os.path.isfile(windowed):
+                target = windowed
         shortcut.TargetPath = target
         # если запускаем через .py — укажем аргумент-скрипт
         if script.endswith(".py") or script.endswith(".pyw"):
@@ -226,16 +222,31 @@ def write_autorun_flag(val: bool) -> bool:
         return False
 
 
-def apply_autorun_setting() -> None:
+def apply_autorun_setting() -> bool:
     """Применить текущее значение autorun: создать или удалить ярлык."""
     try:
         logger.debug("AUTORUN: apply_autorun_setting CALLED")
         if read_autorun_flag():
-            create_startup_shortcut()
+            return create_startup_shortcut()
         else:
-            remove_startup_shortcut()
+            return remove_startup_shortcut()
     except Exception:  # noqa
         logger.exception("apply_autorun_setting: ошибка при применении autorun")
+        return False
+
+
+def set_autorun_enabled(enabled: bool) -> bool:
+    """Сохраняет настройку после успешного изменения ярлыка; откатывает при ошибке записи."""
+    previous = read_autorun_flag()
+    operation = create_startup_shortcut if enabled else remove_startup_shortcut
+    if not operation():
+        return False
+    if write_autorun_flag(enabled):
+        return True
+    rollback = create_startup_shortcut if previous else remove_startup_shortcut
+    if not rollback():
+        logger.error("Не удалось восстановить прежнее состояние автозапуска")
+    return False
 
 
 # ---------------- Exit hotkey (конфиг) ----------------
@@ -246,16 +257,7 @@ def default_exit_hotkey() -> dict:
 
 def read_exit_hotkey() -> dict:
     """Прочитать exit_hotkey из конфига — вернуть {'modifiers': [...], 'key': 'F10'}"""
-    try:
-        j = read_json_config()
-        eh = j.get("exit_hotkey")
-        if not isinstance(eh, dict):
-            return default_exit_hotkey()
-        mods = eh.get("modifiers", []) or []
-        key = eh.get("key", "F10") or "F10"
-        return {"modifiers": list(mods), "key": str(key)}
-    except Exception:  # noqa
-        return default_exit_hotkey()
+    return _read_hotkey("exit_hotkey", default_exit_hotkey())
 
 
 def write_exit_hotkey(modifiers: list[str], key: str) -> bool:
@@ -268,7 +270,7 @@ def write_exit_hotkey(modifiers: list[str], key: str) -> bool:
             j.setdefault("file_logging", False)
             j.setdefault("autorun", False)
             mods = _normalize_modifiers_list(modifiers)
-            j["exit_hotkey"] = {"modifiers": mods, "key": str(key)}
+            j["exit_hotkey"] = {"modifiers": mods, "key": normalize_key(key)}
             ok = write_json_config(j)
         if ok:
             logger.info("config: записан exit_hotkey=%s", j["exit_hotkey"])
@@ -286,16 +288,7 @@ def default_translate_hotkey() -> dict:
 
 def read_translate_hotkey() -> dict:
     """Прочитать translate_hotkey из конфига — вернуть {'modifiers': [...], 'key': 'F4'}"""
-    try:
-        j = read_json_config()
-        th = j.get("translate_hotkey")
-        if not isinstance(th, dict):
-            return default_translate_hotkey()
-        mods = th.get("modifiers", []) or []
-        key = th.get("key", "F4") or "F4"
-        return {"modifiers": list(mods), "key": str(key)}
-    except Exception:  # noqa
-        return default_translate_hotkey()
+    return _read_hotkey("translate_hotkey", default_translate_hotkey())
 
 
 def write_translate_hotkey(modifiers: list[str], key: str) -> bool:
@@ -307,7 +300,7 @@ def write_translate_hotkey(modifiers: list[str], key: str) -> bool:
             j.setdefault("file_logging", False)
             j.setdefault("autorun", False)
             mods = _normalize_modifiers_list(modifiers)
-            j["translate_hotkey"] = {"modifiers": mods, "key": str(key)}
+            j["translate_hotkey"] = {"modifiers": mods, "key": normalize_key(key)}
             ok = write_json_config(j)
         if ok:
             logger.info("config: записан translate_hotkey=%s", j["translate_hotkey"])
@@ -324,16 +317,7 @@ def default_case_hotkey() -> dict:
 
 def read_case_hotkey() -> dict:
     """Прочитать case_hotkey из конфига — вернуть {'modifiers': [...], 'key': 'U'}"""
-    try:
-        j = read_json_config()
-        ch = j.get("case_hotkey")
-        if not isinstance(ch, dict):
-            return default_case_hotkey()
-        mods = ch.get("modifiers", []) or []
-        key = ch.get("key", "U") or "U"
-        return {"modifiers": list(mods), "key": str(key)}
-    except Exception:  # noqa
-        return default_case_hotkey()
+    return _read_hotkey("case_hotkey", default_case_hotkey())
 
 
 def write_case_hotkey(modifiers: list[str], key: str) -> bool:
@@ -345,7 +329,7 @@ def write_case_hotkey(modifiers: list[str], key: str) -> bool:
             j.setdefault("file_logging", False)
             j.setdefault("autorun", False)
             mods = _normalize_modifiers_list(modifiers)
-            j["case_hotkey"] = {"modifiers": mods, "key": str(key)}
+            j["case_hotkey"] = {"modifiers": mods, "key": normalize_key(key)}
             ok = write_json_config(j)
         if ok:
             logger.info("config: записан case_hotkey=%s", j["case_hotkey"])
@@ -381,7 +365,7 @@ def load_config() -> None:
         logger.exception("config: load_config failed - using defaults")
 
 
-def save_config() -> None:
+def save_config() -> bool:
     """
     Сохранить минимальное состояние (enabled) в конфиг.
     Сохраняет остальные ключи, если они есть.
@@ -392,10 +376,13 @@ def save_config() -> None:
                 enabled_val = bool(_enabled)
             j = read_json_config() or {}
             j["enabled"] = enabled_val
-            write_json_config(j)
+            if not write_json_config(j):
+                return False
         logger.debug("config: saved enabled=%s to %s", enabled_val, CONFIG_FILE)
+        return True
     except Exception:  # noqa
         logger.exception("config: save failed")
+        return False
 
 
 def is_enabled() -> bool:
@@ -404,10 +391,16 @@ def is_enabled() -> bool:
         return bool(_enabled)
 
 
-def set_enabled(val: bool) -> None:
+def set_enabled(val: bool) -> bool:
     """Установить enabled и сохранить конфиг."""
     global _enabled
-    with _enabled_lock:
-        _enabled = bool(val)
-    save_config()
+    with _config_lock:
+        with _enabled_lock:
+            previous = _enabled
+            _enabled = bool(val)
+        if not save_config():
+            with _enabled_lock:
+                _enabled = previous
+            return False
     logger.info("state: enabled set to %s", _enabled)
+    return True

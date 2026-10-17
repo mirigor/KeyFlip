@@ -5,21 +5,23 @@
 - проверка mutex (один экземпляр)
 - загрузка конфигурации и применение autorun
 - запуск потока обработки Win hotkey сообщений
-- запуск трей-иконки (pystray) в отдельном потоке
-- ожидание завершения через exit_event
+- интерфейс Qt и трей в главном потоке
+- завершение через exit_event
 """
 
 import importlib.util
+import os
 import sys
 import threading
-import time
+import traceback
 from tkinter import messagebox, Tk
 from typing import Optional
 
-from config import APP_NAME, MUTEX_NAME, load_config, apply_autorun_setting
+from config import APP_NAME, BASE_DIR, MUTEX_NAME, load_config, apply_autorun_setting
 from logging_setup import logger
 
 _DEPENDENCY_IMPORT_ERROR: Exception | None = None
+STARTUP_ERROR_FILE = os.path.join(BASE_DIR, "keyflip-startup-error.log")
 
 try:
     import pyperclip  # noqa: F401
@@ -28,8 +30,7 @@ try:
     import win32con  # noqa: F401
     import win32event
     import win32com.client  # noqa: F401
-    from PIL import Image, ImageDraw  # noqa: F401
-    from pystray import Icon, Menu, MenuItem  # noqa: F401
+    from PySide6.QtWidgets import QApplication  # noqa: F401
 except Exception as e:  # noqa
     _DEPENDENCY_IMPORT_ERROR = e
 
@@ -49,8 +50,7 @@ def check_dependencies() -> None:
 
     required = {
         "pyperclip": "pyperclip",
-        "PIL": "pillow",
-        "pystray": "pystray",
+        "PySide6": "PySide6",
         "psutil": "psutil",
         "win32api": "pywin32",
         "win32com.client": "pywin32",
@@ -131,33 +131,10 @@ def _release_mutex(mutex_handle: Optional[int]) -> None:
     if not mutex_handle:
         return
     try:
-        try:
-            win32event.ReleaseMutex(mutex_handle)
-        except Exception:  # noqa
-            # иногда ReleaseMutex может выдать ошибку — логируем и пытаемся закрыть handle
-            logger.debug("Не удалось ReleaseMutex, пробуем CloseHandle")
-        try:
-            win32api.CloseHandle(mutex_handle)
-        except Exception:  # noqa
-            logger.exception("Не удалось CloseHandle для mutex_handle")
+        # CreateMutex(..., False, ...) не захватывает владение: достаточно закрыть handle.
+        win32api.CloseHandle(mutex_handle)
     except Exception:  # noqa
         logger.exception("_release_mutex: unexpected exception")
-
-
-def _start_worker_threads(win_hotkey_loop, tray_worker) -> tuple[threading.Thread, threading.Thread]:
-    """
-    Запустить два daemon-потока:
-    - WinHotkeyThread: loop для обработки WM_HOTKEY и внутренних сообщений
-    - TrayThread: pystray icon.run()
-    Возвращает (hk_thread, tray_thread).
-    """
-    hk_thread = threading.Thread(target=win_hotkey_loop, name="WinHotkeyThread", daemon=True)
-    tray_thread = threading.Thread(target=tray_worker, name="TrayThread", daemon=True)
-    hk_thread.start()
-    logger.debug("Запущен поток WinHotkeyThread")
-    tray_thread.start()
-    logger.debug("Запущен поток TrayThread")
-    return hk_thread, tray_thread
 
 
 def main() -> None:
@@ -170,61 +147,76 @@ def main() -> None:
         logger.info("%s: обнаружен другой экземпляр -> выход", APP_NAME)
         sys.exit(0)
 
-    # Подключаем обработчик выхода (чтобы on_exit вызывался из winapi при нажатии exit-hotkey)
-    from tray import tray_worker, on_exit
-    from winapi import win_hotkey_loop, exit_event, register_exit_handler
-
+    winapi = None
+    controller = None
+    hk_thread = None
     try:
-        register_exit_handler(on_exit)
-    except Exception:  # noqa
-        logger.exception("Не удалось зарегистрировать exit handler")
+        import winapi
+        from tray import on_exit
+        from ui import TrayController
 
-    # Загрузка конфига и применение autorun (если нужно)
-    try:
+        app = QApplication(sys.argv)
+        app.setApplicationName(APP_NAME)
+        from PySide6.QtGui import QIcon
+        from config import ICON_ON
+        app.setWindowIcon(QIcon(ICON_ON))
+        app.setQuitOnLastWindowClosed(False)
+        winapi.register_exit_handler(on_exit)
         load_config()
-    except Exception:  # noqa
-        logger.exception("Ошибка при load_config() — продолжаем попытку запуска")
-
-    try:
-        apply_autorun_setting()
-    except Exception:  # noqa
-        logger.exception("apply_autorun_setting failed on startup")
-
-    # Запуск потоков
-    try:
-        hk_thread, tray_thread = _start_worker_threads(win_hotkey_loop, tray_worker)
-    except Exception as e:  # noqa
-        logger.exception("Не удалось запустить потоки: %s", e)
-        _release_mutex(mutex_handle)
-        raise
-
-    # Основное ожидание: пока не будет установлен exit_event
-    try:
-        logger.info("Ожидание события завершения...")
-        exit_event.wait()  # блокирующее ожидание
-        logger.info("Сигнал выхода получен.")
+        try:
+            apply_autorun_setting()
+        except Exception:  # noqa
+            logger.exception("apply_autorun_setting failed on startup")
+        hk_thread = threading.Thread(target=winapi.win_hotkey_loop, name="WinHotkeyThread", daemon=True)
+        hk_thread.start()
+        if not winapi.hotkey_ready.wait(timeout=3):
+            raise RuntimeError("Поток горячих клавиш не запустился")
+        controller = TrayController()
+        app.aboutToQuit.connect(controller.close)
+        controller.start()
+        logger.info("Интерфейс Qt запущен")
+        app.exec()
     except KeyboardInterrupt:
-        logger.info("KeyboardInterrupt получен, инициирую завершение.")
-        try:
-            on_exit()
-        except Exception:  # noqa
-            logger.exception("Ошибка при on_exit() на KeyboardInterrupt")
-    except Exception as e:  # noqa
-        logger.exception("main: unexpected exception while waiting: %s", e)
+        if winapi is not None:
+            winapi.exit_event.set()
     finally:
-        # Гарантированное освобождение mutex
-        try:
-            _release_mutex(mutex_handle)
-        except Exception:  # noqa
-            logger.exception("Не удалось освободить mutex при завершении")
-        # Небольшая пауза, чтобы потоки успели корректно завершиться
-        try:
-            time.sleep(0.15)
-        except Exception:  # noqa
-            pass
+        if winapi is not None:
+            winapi.exit_event.set()
+        if controller is not None:
+            controller.close()
+        if hk_thread is not None:
+            try:
+                if winapi.HOTKEY_THREAD_ID:
+                    win32api.PostThreadMessage(winapi.HOTKEY_THREAD_ID, win32con.WM_QUIT, 0, 0)
+            except Exception:  # noqa
+                logger.debug("Поток горячих клавиш уже завершён", exc_info=True)
+            hk_thread.join(timeout=1)
+        if winapi is not None:
+            winapi.wait_for_pending_operations()
+        _release_mutex(mutex_handle)
         logger.info("%s: завершение main()", APP_NAME)
 
 
+def _report_startup_error(error: Exception) -> None:
+    """При запуске через pythonw ошибка видна пользователю и доступна в отдельном журнале."""
+    logger.exception("Ошибка запуска KeyFlip")
+    details = f"{type(error).__name__}: {error}"
+    try:
+        with open(STARTUP_ERROR_FILE, "w", encoding="utf-8") as report:
+            report.write(traceback.format_exc())
+        details += f"\n\nПодробности: {STARTUP_ERROR_FILE}"
+    except OSError:
+        logger.exception("Не удалось записать ошибку запуска")
+    try:
+        win32api.MessageBox(0, details, APP_NAME + " — ошибка запуска", 0x10)
+    except Exception:
+        print(details, file=sys.stderr)
+
+
 if __name__ == "__main__":
-    check_dependencies()
-    main()
+    try:
+        check_dependencies()
+        main()
+    except Exception as error:
+        _report_startup_error(error)
+        sys.exit(1)

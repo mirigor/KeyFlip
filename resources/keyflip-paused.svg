@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64">
+  <title>KeyFlip — на паузе</title>
+  <rect x="0.5" y="0.5" width="63" height="63" rx="14" fill="#252d3d" stroke="#3b465b"/>
+  <g fill="none" stroke-width="5.5" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M14 22H50M42 14L50 22L42 30" stroke="#8c98aa"/>
+    <path d="M50 42H14M22 34L14 42L22 50" stroke="#69778e"/>
+  </g>
+</svg>

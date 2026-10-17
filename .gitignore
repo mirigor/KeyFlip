@@ -1,0 +1,9 @@
+.idea/
+.venv/
+__pycache__/
+*.py[cod]
+keyflip.json
+keyflip.json.tmp
+keyflip.log
+keyflip.log.*
+keyflip-startup-error.log

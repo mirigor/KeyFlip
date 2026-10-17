@@ -65,8 +65,10 @@ def _create_file_handler() -> RotatingFileHandler:
 
 
 # ---------------- Консольный (stdout) хендлер ----------------
-def _create_console_handler() -> logging.StreamHandler:
+def _create_console_handler() -> logging.Handler:
     """Создать и вернуть консольный хендлер (stdout)."""
+    if sys.stdout is None:
+        return logging.NullHandler()
     ch = logging.StreamHandler(sys.stdout)
     ch.setFormatter(fmt)
     ch.setLevel(logging.INFO)
@@ -89,6 +91,7 @@ def _install_handlers() -> None:
             for h in existing:
                 try:
                     logger.removeHandler(h)
+                    h.close()
                 except Exception:  # noqa
                     pass
     except Exception:  # noqa
