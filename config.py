@@ -20,13 +20,21 @@ from hotkeys import normalize_key, normalize_modifiers
 
 APP_NAME = "KeyFlip"
 MUTEX_NAME = r"Global\KeyFlipMutex"
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-LOG_FILE = os.path.join(BASE_DIR, "keyflip.log")
-ICON_ON = os.path.join(BASE_DIR, "resources", "keyflip.ico")
-ICON_OFF = os.path.join(BASE_DIR, "resources", "keyflip-paused.ico")
-ICON_ON_SVG = os.path.join(BASE_DIR, "resources", "keyflip.svg")
-ICON_OFF_SVG = os.path.join(BASE_DIR, "resources", "keyflip-paused.svg")
-CONFIG_FILE = os.path.join(BASE_DIR, "keyflip.json")
+BASE_DIR = os.path.dirname(os.path.abspath(sys.executable if getattr(sys, "frozen", False) else __file__))
+RESOURCE_DIR = getattr(sys, "_MEIPASS", BASE_DIR)
+DATA_DIR = (
+    os.path.join(os.environ.get("LOCALAPPDATA") or os.path.expanduser("~\\AppData\\Local"), APP_NAME)
+    if getattr(sys, "frozen", False)
+    else BASE_DIR
+)
+if getattr(sys, "frozen", False):
+    os.makedirs(DATA_DIR, exist_ok=True)
+LOG_FILE = os.path.join(DATA_DIR, "keyflip.log")
+ICON_ON = os.path.join(RESOURCE_DIR, "resources", "keyflip.ico")
+ICON_OFF = os.path.join(RESOURCE_DIR, "resources", "keyflip-paused.ico")
+ICON_ON_SVG = os.path.join(RESOURCE_DIR, "resources", "keyflip.svg")
+ICON_OFF_SVG = os.path.join(RESOURCE_DIR, "resources", "keyflip-paused.svg")
+CONFIG_FILE = os.path.join(DATA_DIR, "keyflip.json")
 
 # локальный логгер (handlers будут настроены в logging_setup.py)
 logger = logging.getLogger(APP_NAME)
@@ -169,7 +177,9 @@ def create_startup_shortcut() -> bool:
         else:
             shortcut.Arguments = ""
         shortcut.WorkingDirectory = BASE_DIR
-        if os.path.isfile(ICON_ON):
+        if getattr(sys, "frozen", False):
+            shortcut.IconLocation = target
+        elif os.path.isfile(ICON_ON):
             shortcut.IconLocation = ICON_ON
         else:
             shortcut.IconLocation = target

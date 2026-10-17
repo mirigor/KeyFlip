@@ -1,6 +1,10 @@
 .idea/
 .venv/
-KeyFlip.lnk
+build/
+dist/
+/KeyFlip.exe
+/KeyFlipSetup.exe
+*.spec
 __pycache__/
 *.py[cod]
 keyflip.json

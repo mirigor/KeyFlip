@@ -17,11 +17,11 @@ import traceback
 from tkinter import messagebox, Tk
 from typing import Optional
 
-from config import APP_NAME, BASE_DIR, MUTEX_NAME, load_config, apply_autorun_setting
+from config import APP_NAME, DATA_DIR, MUTEX_NAME, load_config, apply_autorun_setting
 from logging_setup import logger
 
 _DEPENDENCY_IMPORT_ERROR: Exception | None = None
-STARTUP_ERROR_FILE = os.path.join(BASE_DIR, "keyflip-startup-error.log")
+STARTUP_ERROR_FILE = os.path.join(DATA_DIR, "keyflip-startup-error.log")
 
 try:
     import pyperclip  # noqa: F401
@@ -45,6 +45,9 @@ def _module_available(module_name: str) -> bool:
 
 def check_dependencies() -> None:
     """Проверяем все необходимые пакеты. Если чего-то нет — сразу говорим и выходим."""
+
+    if getattr(sys, "frozen", False) and _DEPENDENCY_IMPORT_ERROR is None:
+        return
 
     missing = []
 
@@ -72,11 +75,15 @@ def check_dependencies() -> None:
             "\n\nДетали ошибки импорта:\n"
             f"{type(_DEPENDENCY_IMPORT_ERROR).__name__}: {_DEPENDENCY_IMPORT_ERROR}"
         )
+    install_hint = (
+        "Переустанови KeyFlip из установщика."
+        if getattr(sys, "frozen", False)
+        else "Установи одной командой:\npip install -r requirements.txt"
+    )
     msg = (
         "❌ KeyFlip не может запуститься — отсутствуют или некорректно работают библиотеки:\n\n"
         f"{' '.join(missing) if missing else 'см. детали ниже'}\n\n"
-        "Установи одной командой:\n"
-        "pip install -r requirements.txt\n\n"
+        f"{install_hint}\n\n"
         f"После установки перезапусти приложение.{details}"
     )
     try:
@@ -135,6 +142,35 @@ def _release_mutex(mutex_handle: Optional[int]) -> None:
         win32api.CloseHandle(mutex_handle)
     except Exception:  # noqa
         logger.exception("_release_mutex: unexpected exception")
+
+
+def installer_operation(arguments: list[str]) -> int:
+    """Проверка для установщика без запуска трея и вмешательства в горячие клавиши."""
+    if arguments not in (["--installer-check"], ["--uninstall-cleanup"]):
+        return 2
+    try:
+        mutex = win32event.CreateMutex(None, False, MUTEX_NAME)
+        try:
+            if win32api.GetLastError() == ERROR_ALREADY_EXISTS:
+                return 3
+        finally:
+            if mutex:
+                win32api.CloseHandle(mutex)
+        if arguments == ["--uninstall-cleanup"]:
+            from config import _startup_shortcut_path
+
+            shortcut_path = _startup_shortcut_path()
+            if os.path.isfile(shortcut_path):
+                shell = win32com.client.Dispatch("WScript.Shell")
+                shortcut = shell.CreateShortcut(shortcut_path)
+                if os.path.normcase(os.path.abspath(shortcut.TargetPath)) == os.path.normcase(
+                    os.path.abspath(sys.executable)
+                ):
+                    os.remove(shortcut_path)
+        return 0
+    except Exception:
+        logger.exception("Операция установщика не удалась")
+        return 1
 
 
 def main() -> None:
@@ -216,6 +252,8 @@ def _report_startup_error(error: Exception) -> None:
 if __name__ == "__main__":
     try:
         check_dependencies()
+        if len(sys.argv) > 1:
+            sys.exit(installer_operation(sys.argv[1:]))
         main()
     except Exception as error:
         _report_startup_error(error)

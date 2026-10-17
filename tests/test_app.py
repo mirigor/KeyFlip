@@ -17,6 +17,35 @@ ENTRY = runpy.run_path(os.path.join(config.BASE_DIR, "app.pyw"))
 
 
 class StartupTests(unittest.TestCase):
+    def test_installer_operation_rejects_unknown_argument(self):
+        self.assertEqual(ENTRY["installer_operation"](["--unexpected"]), 2)
+
+    def test_installer_operation_detects_running_instance(self):
+        operation = ENTRY["installer_operation"]
+        with patch.object(ENTRY["win32event"], "CreateMutex", return_value=123), \
+                patch.object(ENTRY["win32api"], "GetLastError", return_value=183), \
+                patch.object(ENTRY["win32api"], "CloseHandle") as close:
+            self.assertEqual(operation(["--installer-check"]), 3)
+            close.assert_called_once_with(123)
+
+    def test_uninstall_cleanup_removes_only_own_autorun(self):
+        operation = ENTRY["installer_operation"]
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(config, "_startup_shortcut_path", return_value=os.path.join(directory, "KeyFlip.lnk")), \
+                patch.object(ENTRY["win32event"], "CreateMutex", return_value=123), \
+                patch.object(ENTRY["win32api"], "GetLastError", return_value=0), \
+                patch.object(ENTRY["win32api"], "CloseHandle"), \
+                patch.object(ENTRY["win32com"].client, "Dispatch") as dispatch:
+            shortcut_path = os.path.join(directory, "KeyFlip.lnk")
+            with open(shortcut_path, "wb") as shortcut_file:
+                shortcut_file.write(b"test")
+            dispatch.return_value.CreateShortcut.return_value.TargetPath = "C:\\Other\\KeyFlip.exe"
+            self.assertEqual(operation(["--uninstall-cleanup"]), 0)
+            self.assertTrue(os.path.isfile(shortcut_path))
+            dispatch.return_value.CreateShortcut.return_value.TargetPath = sys.executable
+            self.assertEqual(operation(["--uninstall-cleanup"]), 0)
+            self.assertFalse(os.path.exists(shortcut_path))
+
     def test_console_handler_does_not_write_to_missing_pythonw_stream(self):
         import logging
         with patch.object(logging_setup.sys, "stdout", None):
